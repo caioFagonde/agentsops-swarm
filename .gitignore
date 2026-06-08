@@ -1,37 +1,13 @@
-# AgentOps runtime
-.agentops/reports/
-.agentops/scouts/
+.agentops/runtime/
 .agentops/events.jsonl
 .agentops/budget.json
+.agentops/reports/
 .agent-worktrees/
-
-# Secrets/runtime
+__pycache__/
+*.pyc
 .env
 .env.*
 !.env.example
 secrets/
-*.pem
-*.key
-*.p12
-*.pfx
+credentials*.json
 *token*.json
-credentials.json
-client_secret*.json
-logs/
-backups/
-data/
-
-# Python
-__pycache__/
-*.py[cod]
-.venv/
-.pytest_cache/
-
-# Node
-node_modules/
-
-# OS/editor
-.DS_Store
-Thumbs.db
-.vscode/
-.idea/

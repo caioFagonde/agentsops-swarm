@@ -1,1039 +1,1451 @@
-#!/usr/bin/env python3
-"""AgentOps Swarm: reusable local multi-agent orchestration for Claude Code, Codex, and Antigravity.
-
-Design constraints:
-- Work is isolated in git worktrees.
-- Agents may write branches; only merge gates integrate.
-- Secrets and runtime data are excluded from prompts and path grants by policy.
-- The CLI is intentionally filesystem-first; no daemon required.
-"""
 from __future__ import annotations
 
 import argparse
 import json
 import os
-import platform
+import random
+import re
+import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
-import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 
-VERSION = "2.1.0"
-APP_DIR = ".agentops"
-WT_DIR = ".agent-worktrees"
-FORBIDDEN_FRAGMENTS = (
-    ".env", "secrets", "backup", "backups", "logs", "token", "credentials", "client_secret",
-    "private_key", "id_rsa", "id_ed25519", ".pem", ".p12", ".pfx", "oauth", "refresh"
+try:
+    from . import __version__
+except Exception:
+    __version__ = "3.0.0"
+
+ROOT = Path.cwd()
+AGENTOPS_DIR = ROOT / ".agentops"
+WORKTREE_DIR = ROOT / ".agent-worktrees"
+ACTIVE_PATH = AGENTOPS_DIR / "active.json"
+CONFIG_PATH = AGENTOPS_DIR / "config.json"
+EVENTS_PATH = AGENTOPS_DIR / "events.jsonl"
+BUDGET_PATH = AGENTOPS_DIR / "budget.json"
+TASKS_DIR = AGENTOPS_DIR / "tasks"
+REPORTS_DIR = AGENTOPS_DIR / "reports"
+RUNTIME_DIR = AGENTOPS_DIR / "runtime"
+LOG_DIR = RUNTIME_DIR / "logs"
+SCOUTS_DIR = AGENTOPS_DIR / "scouts"
+ROLLBACKS_DIR = AGENTOPS_DIR / "rollbacks"
+PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+TEMPLATES_DIR = PACKAGE_ROOT / "templates"
+
+USAGE_LIMIT_RE = re.compile(
+    r"usage limit|session limit|rate limit|too many requests|\b429\b|quota|limit reached|try again|reset|5.?hour|five.?hour|overloaded|temporarily unavailable",
+    re.IGNORECASE,
 )
+
+DEFAULT_PROFILES: dict[str, dict[str, str]] = {
+    "opus-planner": {"engine": "claude", "model": "opus", "role": "planner"},
+    "haiku-scout": {"engine": "claude", "model": "haiku", "role": "scout"},
+    "sonnet-executor": {"engine": "claude", "model": "sonnet", "role": "executor"},
+    "sonnet-repair": {"engine": "claude", "model": "sonnet", "role": "repair"},
+    "codex-verifier": {"engine": "codex", "model": "", "role": "verifier"},
+    "gpt-codex": {"engine": "codex", "model": "", "role": "executor"},
+    "antigravity-executor": {"engine": "antigravity", "model": "", "role": "executor"},
+}
+
 DEFAULT_CHECKS = [
-    "python3 -m pytest tests -q",
-    "./scripts/check-secrets.sh",
+    "test -x scripts/agents/run-pytest.sh && scripts/agents/run-pytest.sh tests -q || python3 -m pytest tests -q",
+    "test -x ./scripts/check-secrets.sh && ./scripts/check-secrets.sh || true",
+]
+
+THEMES = ["nebula", "matrix", "reactor", "satellite", "deepsea", "arcade", "aurora", "oracle", "noir", "solar"]
+SPINNERS = ["⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏", "◐◓◑◒", "▖▘▝▗", "←↖↑↗→↘↓↙", "⟡✦✧◆◇", "🌑🌒🌓🌔🌕🌖🌗🌘"]
+QUOTES = [
+    "compiling intent into motion",
+    "synchronizing the swarm lattice",
+    "polishing the command deck",
+    "negotiating with entropy",
+    "mapping diffs across hyperspace",
+    "braiding context into code",
+    "stabilizing the local-first continuum",
+    "turning scattered scaffolds into systems",
+    "checking invariants before the jump",
+    "building quietly, refusing chaos",
+    "fusing small patches into leverage",
+    "routing cognition through worktrees",
 ]
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+def color(text: str, code: str) -> str:
+    if os.environ.get("NO_COLOR"):
+        return text
+    return f"\033[{code}m{text}\033[0m"
 
 
-def repo_root(start: Path | None = None) -> Path:
-    start = (start or Path.cwd()).resolve()
-    try:
-        out = subprocess.check_output(["git", "rev-parse", "--show-toplevel"], cwd=start, text=True).strip()
-        return Path(out).resolve()
-    except Exception:
-        return start
+def info(msg: str) -> None:
+    print(color("→", "34") + " " + msg)
 
 
-def app_root() -> Path:
-    return repo_root() / APP_DIR
+def ok(msg: str) -> None:
+    print(color("✓", "32") + " " + msg)
 
 
-def worktree_root() -> Path:
-    return repo_root() / WT_DIR
+def warn(msg: str) -> None:
+    print(color("⚠", "33") + " " + msg)
+
+
+def fail(msg: str, code: int = 1) -> None:
+    print(color("✗", "31") + " " + msg, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def run(cmd: str | list[str], cwd: Path | None = None, check: bool = False, capture: bool = False, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    if isinstance(cmd, list):
+        args = cmd
+        shell = False
+        display = " ".join(shlex.quote(x) for x in cmd)
+    else:
+        args = cmd
+        shell = True
+        display = cmd
+    event(None, "command", display, {"cwd": str(cwd or ROOT)})
+    return subprocess.run(args, cwd=str(cwd or ROOT), text=True, shell=shell, capture_output=capture, check=check, env=env)
+
+
+def now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 def ensure_dirs() -> None:
-    root = app_root()
-    for sub in ["tasks", "reports", "scouts", "events", "planner", "examples", "budgets", "logs"]:
-        (root / sub).mkdir(parents=True, exist_ok=True)
-    worktree_root().mkdir(parents=True, exist_ok=True)
+    for p in [AGENTOPS_DIR, TASKS_DIR, REPORTS_DIR, RUNTIME_DIR, LOG_DIR, SCOUTS_DIR, WORKTREE_DIR, ROLLBACKS_DIR, AGENTOPS_DIR / "examples"]:
+        p.mkdir(parents=True, exist_ok=True)
 
 
-def run(cmd: list[str] | str, cwd: Path | None = None, check: bool = True, capture: bool = False, shell: bool = False) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, cwd=str(cwd or repo_root()), check=check, text=True, capture_output=capture, shell=shell)
+def event(task: str | None, typ: str, message: str, data: dict[str, Any] | None = None) -> None:
+    try:
+        ensure_dirs()
+        rec = {"ts": now_iso(), "task": task, "type": typ, "message": message, "data": data or {}}
+        with EVENTS_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
 
-def read_json(path: Path, default: Any) -> Any:
+def load_json(path: Path, default: Any) -> Any:
     if not path.exists():
         return default
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        fail(f"Invalid JSON at {path}: {exc}")
 
 
-def write_json(path: Path, data: Any) -> None:
+def save_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-def active_path() -> Path:
-    return app_root() / "active.json"
-
-
-def config_path() -> Path:
-    return app_root() / "config.json"
-
-
-def load_active() -> dict[str, Any]:
-    return read_json(active_path(), {"version": 1, "project": repo_root().name, "tasks": []})
-
-
-def save_active(data: dict[str, Any]) -> None:
-    write_json(active_path(), data)
-
-
-def load_config() -> dict[str, Any]:
-    return read_json(config_path(), default_config())
-
-
-def save_config(data: dict[str, Any]) -> None:
-    write_json(config_path(), data)
-
-
-def default_config() -> dict[str, Any]:
+def default_config(name: str = "project") -> dict[str, Any]:
     return {
-        "version": 1,
-        "project_root": str(repo_root()),
-        "terminal": "auto",
-        "default_permission": "workspace",
-        "model_profiles": {
-            "opus-planner": {"engine": "claude", "model": os.environ.get("AGENTOPS_OPUS_MODEL", "opus"), "role": "planner"},
-            "haiku-scout": {"engine": "claude", "model": os.environ.get("AGENTOPS_HAIKU_MODEL", "haiku"), "role": "scout"},
-            "sonnet-executor": {"engine": "claude", "model": os.environ.get("AGENTOPS_SONNET_MODEL", "sonnet"), "role": "executor"},
-            "sonnet-repair": {"engine": "claude", "model": os.environ.get("AGENTOPS_SONNET_MODEL", "sonnet"), "role": "repair"},
-            "codex-verifier": {"engine": "codex", "model": os.environ.get("AGENTOPS_CODEX_MODEL", ""), "role": "verifier"},
-            "antigravity-executor": {"engine": "antigravity", "model": os.environ.get("AGENTOPS_AGY_MODEL", ""), "role": "executor"},
+        "version": 3,
+        "project": name,
+        "defaults": {
+            "mode": "headless",
+            "permission": "workspace",
+            "pretty": True,
+            "fallback": "ask",
+            "fallback_requires_confirmation": True,
+            "auto_repair_requires_confirmation": True,
+            "terminal": "auto",
+            "max_parallel": 3,
         },
-        "checks": [],
-        "forbidden_fragments": list(FORBIDDEN_FRAGMENTS),
-        "budget": {"currency": "token-minutes", "max_parallel_workers": 4, "sprint_minutes": 60},
+        "profiles": DEFAULT_PROFILES,
+        "checks": DEFAULT_CHECKS,
     }
 
 
-def event_path() -> Path:
-    return app_root() / "events.jsonl"
-
-
-def log_event(kind: str, **payload: Any) -> None:
+def ensure_init(name: str | None = None, force: bool = False) -> None:
     ensure_dirs()
-    record = {"ts": utc_now(), "kind": kind, **payload}
-    with event_path().open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    if force or not CONFIG_PATH.exists():
+        save_json(CONFIG_PATH, default_config(name or ROOT.name))
+    if force or not ACTIVE_PATH.exists():
+        save_json(ACTIVE_PATH, {"version": 3, "project": {"name": name or ROOT.name}, "tasks": []})
+    (AGENTOPS_DIR / "examples" / "README.md").write_text(
+        "# AgentOps Examples\n\nDrop screenshots, markdown briefs, HTML prototypes, sketches, and fake data here. Do not store secrets or private data. Run `agentops examples-index`.\n",
+        encoding="utf-8",
+    ) if not (AGENTOPS_DIR / "examples" / "README.md").exists() else None
 
 
-def budget_path() -> Path:
-    return app_root() / "budget.json"
+def require_init() -> None:
+    if not ACTIVE_PATH.exists() or not CONFIG_PATH.exists():
+        fail("AgentOps is not initialized here. Run: agentops init --name <project>")
 
 
-def budget_load() -> dict[str, Any]:
-    return read_json(budget_path(), {"runs": [], "total_seconds": 0, "by_task": {}})
+def active() -> dict[str, Any]:
+    require_init()
+    return load_json(ACTIVE_PATH, {"version": 3, "tasks": []})
 
 
-def budget_save(data: dict[str, Any]) -> None:
-    write_json(budget_path(), data)
+def config() -> dict[str, Any]:
+    require_init()
+    cfg = load_json(CONFIG_PATH, default_config(ROOT.name))
+    if "profiles" not in cfg:
+        cfg["profiles"] = DEFAULT_PROFILES
+    return cfg
 
 
-def budget_start(task_id: str, engine: str, mode: str) -> str:
-    rid = f"run-{uuid.uuid4().hex[:12]}"
-    data = budget_load()
-    data["runs"].append({"id": rid, "task_id": task_id, "engine": engine, "mode": mode, "started_at": utc_now(), "ended_at": None, "seconds": None})
-    budget_save(data)
-    return rid
+def save_active(a: dict[str, Any]) -> None:
+    save_json(ACTIVE_PATH, a)
 
 
-def budget_end(run_id: str) -> None:
-    data = budget_load()
-    now = time.time()
-    for r in data.get("runs", []):
-        if r.get("id") == run_id and r.get("ended_at") is None:
-            started = datetime.fromisoformat(r["started_at"]).timestamp()
-            seconds = max(0, int(now - started))
-            r["ended_at"] = utc_now()
-            r["seconds"] = seconds
-            data["total_seconds"] = int(data.get("total_seconds", 0)) + seconds
-            by = data.setdefault("by_task", {})
-            by[r["task_id"]] = int(by.get(r["task_id"], 0)) + seconds
-            break
-    budget_save(data)
-
-
-def branch_name(task_id: str) -> str:
-    return f"agent/{task_id}"
+def tasks() -> list[dict[str, Any]]:
+    return active().get("tasks", [])
 
 
 def task_by_id(task_id: str) -> dict[str, Any]:
-    active = load_active()
-    for task in active.get("tasks", []):
-        if task.get("id") == task_id:
-            return task
-    raise SystemExit(f"Unknown task: {task_id}")
+    for t in tasks():
+        if t.get("id") == task_id:
+            return t
+    fail(f"Unknown task: {task_id}")
 
 
-def task_worktree(task_id: str) -> Path:
-    return worktree_root() / task_id
-
-
-def path_forbidden(p: str) -> bool:
-    low = p.lower().replace("\\", "/")
-    # allow design tokens, tokenization, and tokenizer source paths; block secret-like token files.
-    allowed_words = ["design/tokens", "tokenizer", "tokenization", "tokens.ts", "tokens.scss"]
-    if any(a in low for a in allowed_words):
-        return False
-    return any(x in low for x in FORBIDDEN_FRAGMENTS)
-
-
-def check_task_safety(task: dict[str, Any]) -> list[str]:
-    issues = []
-    for field in ("allowed_paths", "locked_paths"):
-        for p in task.get(field, []) or []:
-            if path_forbidden(str(p)):
-                issues.append(f"{task.get('id')} {field} contains forbidden path fragment: {p}")
-    return issues
-
-
-def template_dir() -> Path:
-    # When installed, templates live beside this package in the repo distribution.
-    candidates = [
-        Path(__file__).resolve().parents[1] / "templates",
-        Path(__file__).resolve().parent.parent / "templates",
-        Path.cwd() / "agentops-swarm" / "templates",
-        Path.home() / ".local" / "share" / "agentops-swarm" / "templates",
-    ]
-    for c in candidates:
-        if c.exists():
-            return c
-    return candidates[0]
-
-
-def role_template(profile: str) -> str:
-    path = template_dir() / "roles" / f"{profile}.md"
-    if path.exists():
-        return path.read_text(encoding="utf-8")
-    return ""
-
-
-def framework_template(name: str | None) -> str:
+def profile(name: str | None) -> dict[str, str]:
+    cfg = config()
+    profiles = cfg.get("profiles", {})
     if not name:
-        name = "generic"
-    path = template_dir() / "frameworks" / f"{name}.md"
-    if path.exists():
-        return path.read_text(encoding="utf-8")
+        return profiles.get("sonnet-executor", DEFAULT_PROFILES["sonnet-executor"])
+    if name not in profiles:
+        fail(f"Unknown profile: {name}")
+    return profiles[name]
+
+
+def branch_for(task_id: str) -> str:
+    t = task_by_id(task_id)
+    return t.get("branch") or f"agent/{task_id}"
+
+
+def wt_for(task_id: str) -> Path:
+    return WORKTREE_DIR / task_id
+
+
+def prompt_path(task_id: str, root: Path | None = None) -> Path:
+    return (root or ROOT) / ".agentops" / "tasks" / f"{task_id}.prompt.md"
+
+
+def report_path(task_id: str, root: Path | None = None) -> Path:
+    return (root or ROOT) / ".agentops" / "reports" / task_id / "report.md"
+
+
+def task_prompt(task_id: str, root: Path | None = None) -> str:
+    p = prompt_path(task_id, root)
+    if p.exists():
+        return p.read_text(encoding="utf-8")
+    t = task_by_id(task_id)
+    rendered = generate_prompt_from_task(t)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(rendered, encoding="utf-8")
+    return rendered
+
+
+def read_template(kind: str, name: str) -> str:
+    p = TEMPLATES_DIR / kind / f"{name}.md"
+    if p.exists():
+        return p.read_text(encoding="utf-8")
     return ""
 
 
-def write_task_prompt(task: dict[str, Any]) -> Path:
-    ensure_dirs()
-    tid = task["id"]
-    profile = task.get("profile") or task.get("model_profile") or "sonnet-executor"
-    framework = task.get("framework", "generic")
-    prompt = f"""
-# AgentOps Task: {tid}
+def generate_prompt_from_task(t: dict[str, Any]) -> str:
+    framework = t.get("framework", "generic")
+    profile_name = t.get("profile", "sonnet-executor")
+    framework_text = read_template("frameworks", framework)
+    role = profile(profile_name).get("role", "executor") if CONFIG_PATH.exists() else "executor"
+    role_text = read_template("roles", profile_name) or read_template("roles", f"sonnet-{role}")
+    allowed = "\n".join(f"- {p}" for p in t.get("allowed_paths", [])) or "- Use judgment; keep scope narrow."
+    locked = "\n".join(f"- {p}" for p in t.get("locked_paths", [])) or "- None declared."
+    acceptance = "\n".join(f"- {x}" for x in t.get("acceptance", [])) or "- Implement the task correctly and add tests."
+    checks = "\n".join(f"- `{x}`" for x in t.get("checks", [])) or "- Run relevant tests."
+    return f"""# AgentOps task: {t.get('id')}
 
-## Role
-{role_template(profile)}
+Title: {t.get('title', t.get('id'))}
+Priority: {t.get('priority', 'p1')}
+Tranche: {t.get('tranche', 'unassigned')}
+Executor profile: {profile_name}
+Framework: {framework}
 
-## Framework Guidance
-{framework_template(framework)}
+## Role guidance
 
-## Task
-Title: {task.get('title', tid)}
-Priority: {task.get('priority', 'p1')}
-Executor: {task.get('executor', 'claude')}
+{role_text.strip() or 'You are a bounded implementation worker.'}
 
-## Allowed paths
-{json.dumps(task.get('allowed_paths', []), indent=2)}
+## Framework guidance
 
-## Locked paths
-{json.dumps(task.get('locked_paths', []), indent=2)}
+{framework_text.strip() or 'Use the project conventions.'}
 
-## Acceptance criteria
-{json.dumps(task.get('acceptance', []), indent=2, ensure_ascii=False)}
+## Hard safety rules
 
-## Checks
-{json.dumps(task.get('checks', []), indent=2, ensure_ascii=False)}
-
-## Safety
-- Do not read, print, modify, or commit .env, .env.*, secrets/, credentials, tokens, private keys, backups/, data/, logs/, or personal data.
-- Do not perform destructive actions.
+- Do not read, print, modify, or commit `.env`, `.env.*`, secrets, private keys, tokens, credentials, backups, logs, or private data.
+- Do not weaken authentication, authorization, or approval gates.
+- Do not run destructive commands unless explicitly required and approved.
 - Do not push to remote.
 - Keep changes bounded to the task.
-- Write a report to `.agentops/reports/{tid}/report.md` before finishing.
+- Add or preserve tests. Do not delete meaningful tests to pass CI.
 
-## Examples / reference material
-If `.agentops/examples/GENERATED_INDEX.md` exists, read it and inspect only relevant example files. Use visual/material examples as inspiration/specification, not as copied assets unless the user owns them.
+## Allowed paths
 
-## Final report format
-Write:
-- status
+{allowed}
+
+## Locked/high-risk paths
+
+{locked}
+
+## Acceptance criteria
+
+{acceptance}
+
+## Checks to run
+
+{checks}
+
+## Required report
+
+Write a report to:
+
+`.agentops/reports/{t.get('id')}/report.md`
+
+Include:
 - root cause / implementation summary
 - files changed
-- tests run
-- results
-- risks
+- tests/checks run
+- failures or risks
 - follow-up tasks
-""".strip() + "\n"
-    path = app_root() / "tasks" / f"{tid}.prompt.md"
-    path.write_text(prompt, encoding="utf-8")
-    return path
+"""
 
+
+def normalize_task(raw: dict[str, Any]) -> dict[str, Any]:
+    task_id = raw.get("id") or re.sub(r"[^a-z0-9-]+", "-", raw.get("title", "task").lower()).strip("-")
+    return {
+        "id": task_id,
+        "title": raw.get("title", task_id),
+        "tranche": raw.get("tranche", 1),
+        "priority": raw.get("priority", "p1"),
+        "executor": raw.get("executor", raw.get("engine", "claude")),
+        "profile": raw.get("profile", profile_for_executor(raw.get("executor", raw.get("engine", "claude")))),
+        "framework": raw.get("framework", "generic"),
+        "branch": raw.get("branch", f"agent/{task_id}"),
+        "allowed_paths": raw.get("allowed_paths", []),
+        "locked_paths": raw.get("locked_paths", []),
+        "acceptance": raw.get("acceptance", []),
+        "checks": raw.get("checks", []),
+    }
+
+
+def profile_for_executor(executor: str) -> str:
+    if executor == "codex":
+        return "gpt-codex"
+    if executor == "antigravity":
+        return "antigravity-executor"
+    return "sonnet-executor"
+
+
+def tasks_for_selector(task_ids: list[str] | None = None, tranche: str | None = None, all_tasks: bool = False) -> list[dict[str, Any]]:
+    ts = tasks()
+    if all_tasks:
+        return ts
+    if task_ids:
+        return [task_by_id(x) for x in task_ids]
+    if tranche is not None:
+        return [t for t in ts if str(t.get("tranche")) == str(tranche)]
+    fail("Specify task id(s), --tranche, or --all")
+
+
+def sync_agentops_to_worktree(task_id: str) -> None:
+    wt = wt_for(task_id)
+    if not wt.exists():
+        return
+    dst = wt / ".agentops"
+    dst.mkdir(parents=True, exist_ok=True)
+    # Copy task metadata without noisy runtime files.
+    for name in ["active.json", "config.json"]:
+        src = AGENTOPS_DIR / name
+        if src.exists():
+            shutil.copy2(src, dst / name)
+    for name in ["tasks", "examples", "scouts"]:
+        src = AGENTOPS_DIR / name
+        dd = dst / name
+        if src.exists():
+            if dd.exists():
+                shutil.rmtree(dd)
+            ignore = shutil.ignore_patterns("runtime", "logs", "reports", "*.log", "events.jsonl", "budget.json")
+            shutil.copytree(src, dd, ignore=ignore)
+    # Ensure prompt exists in worktree too.
+    p = prompt_path(task_id)
+    if not p.exists():
+        task_prompt(task_id)
+    (dst / "tasks").mkdir(exist_ok=True)
+    if p.exists():
+        shutil.copy2(p, dst / "tasks" / p.name)
+
+
+def create_worktree(task_id: str, force: bool = False) -> Path:
+    require_init()
+    t = task_by_id(task_id)
+    wt = wt_for(task_id)
+    branch = branch_for(task_id)
+    if wt.exists() and not force:
+        sync_agentops_to_worktree(task_id)
+        return wt
+    if force and wt.exists():
+        remove_worktree(task_id, remove_branch=False, yes=True)
+    WORKTREE_DIR.mkdir(exist_ok=True)
+    if run(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], check=False).returncode == 0:
+        run(["git", "worktree", "add", str(wt), branch], check=True)
+    else:
+        run(["git", "worktree", "add", str(wt), "-b", branch], check=True)
+    sync_agentops_to_worktree(task_id)
+    event(task_id, "worktree_created", str(wt), {"branch": branch})
+    return wt
+
+
+def remove_worktree(task_id: str, remove_branch: bool = True, yes: bool = False) -> None:
+    wt = wt_for(task_id)
+    branch = branch_for(task_id) if ACTIVE_PATH.exists() else f"agent/{task_id}"
+    if not yes and not confirm(f"Remove worktree {wt} and branch {branch}?", default=False):
+        return
+    run(["git", "worktree", "remove", "--force", str(wt)], check=False)
+    if wt.exists():
+        shutil.rmtree(wt, ignore_errors=True)
+    if remove_branch:
+        run(["git", "branch", "-D", branch], check=False)
+    run(["git", "worktree", "prune"], check=False)
+    shutil.rmtree(REPORTS_DIR / task_id, ignore_errors=True)
+    for p in LOG_DIR.glob(f"{task_id}-*.log"):
+        p.unlink(missing_ok=True)
+    event(task_id, "cleaned", "worktree cleaned", {"branch_removed": remove_branch})
+
+
+def confirm(msg: str, default: bool = False, assume_yes: bool = False) -> bool:
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        return default
+    suffix = "[Y/n]" if default else "[y/N]"
+    ans = input(f"{msg} {suffix} ").strip().lower()
+    if not ans:
+        return default
+    return ans in {"y", "yes", "s", "sim"}
+
+
+def escape_cmd_for_terminal(cmd: str) -> str:
+    return cmd.replace("'", "'\\''")
+
+
+def spawn_terminal(title: str, cmd: str, terminal: str = "auto") -> None:
+    event(None, "spawn", f"{title}: {cmd}")
+    escaped = escape_cmd_for_terminal(cmd)
+    if terminal == "tmux":
+        run("tmux new-session -d -s agentops 2>/dev/null || true", check=False)
+        run(f"tmux new-window -t agentops -n {shlex.quote(title[:24])} 'bash -lc '\''{escaped}'\'''", check=False)
+        return
+    if terminal == "current":
+        subprocess.run(["bash", "-lc", cmd])
+        return
+    candidates: list[list[str]] = []
+    if terminal in {"auto", "gnome"} and shutil.which("gnome-terminal"):
+        candidates.append(["gnome-terminal", f"--title={title}", "--", "bash", "-lc", cmd])
+    if terminal in {"auto", "x-terminal"} and shutil.which("x-terminal-emulator"):
+        candidates.append(["x-terminal-emulator", "-T", title, "-e", "bash", "-lc", cmd])
+    if terminal in {"auto", "kgx"} and shutil.which("kgx"):
+        candidates.append(["kgx", f"--title={title}", "--", "bash", "-lc", cmd])
+    if terminal in {"auto", "konsole"} and shutil.which("konsole"):
+        candidates.append(["konsole", "--new-tab", "--title", title, "-e", "bash", "-lc", cmd])
+    if terminal in {"auto", "xfce"} and shutil.which("xfce4-terminal"):
+        candidates.append(["xfce4-terminal", f"--title={title}", f"--command=bash -lc {shlex.quote(cmd)}"])
+    if terminal in {"auto", "kitty"} and shutil.which("kitty"):
+        candidates.append(["kitty", "--title", title, "bash", "-lc", cmd])
+    if terminal in {"auto", "alacritty"} and shutil.which("alacritty"):
+        candidates.append(["alacritty", "--title", title, "-e", "bash", "-lc", cmd])
+    if terminal in {"auto", "xterm"} and shutil.which("xterm"):
+        candidates.append(["xterm", "-T", title, "-e", "bash", "-lc", cmd])
+    for c in candidates:
+        try:
+            subprocess.Popen(c)
+            return
+        except Exception:
+            continue
+    if shutil.which("tmux"):
+        warn("No GUI terminal worked; falling back to tmux. Attach with: tmux attach -t agentops")
+        spawn_terminal(title, cmd, terminal="tmux")
+        return
+    warn("No supported terminal found. Run manually:")
+    print(cmd)
+
+
+def write_budget_start(task_id: str, engine: str) -> str:
+    data = load_json(BUDGET_PATH, {"runs": []})
+    run_id = f"{task_id}-{int(time.time())}-{random.randint(1000,9999)}"
+    data.setdefault("runs", []).append({"id": run_id, "task": task_id, "engine": engine, "started_at": now_iso(), "status": "running"})
+    save_json(BUDGET_PATH, data)
+    return run_id
+
+
+def write_budget_end(run_id: str, status: str) -> None:
+    data = load_json(BUDGET_PATH, {"runs": []})
+    for r in data.get("runs", []):
+        if r.get("id") == run_id:
+            r["ended_at"] = now_iso()
+            r["status"] = status
+            break
+    save_json(BUDGET_PATH, data)
+
+
+def worker_command(task_id: str, mode: str, permission: str, profile_name: str | None = None, fallback: str = "ask", yes: bool = False) -> tuple[list[str], str, str]:
+    t = task_by_id(task_id)
+    prof = profile(profile_name or t.get("profile"))
+    engine = t.get("executor") or prof.get("engine", "claude")
+    model = prof.get("model", "")
+    wt = create_worktree(task_id)
+    prompt = task_prompt(task_id)
+    log_file = LOG_DIR / f"{task_id}-{engine}-{int(time.time())}.log"
+    if engine == "claude":
+        cmd = ["claude"]
+        if model and shutil.which("claude"):
+            # Claude accepts --model in recent CLI builds. If not, failure will be visible and fallback can kick in.
+            cmd += ["--model", model]
+        if mode == "headless":
+            if permission == "full":
+                cmd += ["--permission-mode", "bypassPermissions"]
+            cmd += ["-p", prompt]
+        else:
+            if permission == "full":
+                cmd += ["--permission-mode", "bypassPermissions"]
+    elif engine in {"codex", "gpt"}:
+        if mode == "headless":
+            cmd = ["codex", "exec"]
+            if permission == "full":
+                cmd += ["--dangerously-bypass-approvals-and-sandbox"]
+            else:
+                cmd += ["--sandbox", "workspace-write"]
+            cmd += ["--cd", str(wt), prompt]
+        else:
+            cmd = ["codex"]
+            if permission == "full":
+                cmd += ["--dangerously-bypass-approvals-and-sandbox"]
+            else:
+                cmd += ["--sandbox", "workspace-write"]
+            cmd += ["--cd", str(wt)]
+    elif engine in {"antigravity", "agy"}:
+        # Syntax varies; support template, otherwise interactive agy in worktree.
+        template = os.environ.get("AGENTOPS_ANTIGRAVITY_EXEC_TEMPLATE")
+        if template and mode == "headless":
+            prompt_file = wt / ".agentops" / f"{task_id}-prompt.md"
+            prompt_file.write_text(prompt, encoding="utf-8")
+            shell_cmd = template.replace("{prompt}", str(prompt_file)).replace("{worktree}", str(wt))
+            return ["bash", "-lc", shell_cmd], engine, str(log_file)
+        cmd = ["agy"]
+    else:
+        fail(f"Unsupported engine: {engine}")
+    return cmd, engine, str(log_file)
+
+
+def should_fallback(log_text: str, rc: int, on_any: bool) -> bool:
+    return bool(rc != 0 and (on_any or USAGE_LIMIT_RE.search(log_text)))
+
+
+def fallback_engine_choice(default: str, yes: bool) -> str:
+    if default != "ask":
+        return default
+    if yes or not sys.stdin.isatty():
+        return "pause"
+    print("\nWorker failed or hit a model limit. Continue with fallback?")
+    print("  1) Codex/GPT")
+    print("  2) Antigravity")
+    print("  3) Retry original later")
+    print("  4) Pause")
+    choice = input("Selection [1-4]: ").strip()
+    return {"1": "codex", "2": "antigravity", "3": "retry", "4": "pause", "": "pause"}.get(choice, "pause")
+
+
+def run_task_engine(task_id: str, mode: str = "headless", permission: str = "workspace", profile_name: str | None = None, pretty: bool = True, fallback: str = "ask", yes: bool = False, fallback_on_any: bool = False) -> int:
+    ensure_dirs()
+    cmd, engine, log_file_s = worker_command(task_id, mode, permission, profile_name)
+    log_file = Path(log_file_s)
+    run_id = write_budget_start(task_id, engine)
+    event(task_id, "worker_start", f"starting {engine}", {"cmd": cmd, "log": str(log_file)})
+    if pretty:
+        rc = run_pretty_subprocess(task_id, engine, cmd, log_file)
+    else:
+        with log_file.open("w", encoding="utf-8") as f:
+            p = subprocess.Popen(cmd, cwd=str(wt_for(task_id)), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            assert p.stdout
+            for line in p.stdout:
+                print(line, end="")
+                f.write(line)
+            rc = p.wait()
+    log_text = log_file.read_text(errors="ignore") if log_file.exists() else ""
+    if should_fallback(log_text, rc, fallback_on_any):
+        choice = fallback_engine_choice(fallback, yes)
+        event(task_id, "fallback_choice", choice)
+        if choice in {"codex", "gpt", "antigravity", "agy"}:
+            rc = run_fallback(task_id, permission, choice, log_file, pretty=pretty, yes=yes)
+        elif choice == "retry":
+            warn("Retry requested later. Worktree preserved.")
+            rc = 75
+        else:
+            warn("Task paused. Worktree preserved.")
+            rc = 76
+    if rc == 0:
+        commit_dirty(task_id, fallback=False)
+        event(task_id, "worker_completed", "completed")
+        write_budget_end(run_id, "completed")
+    else:
+        event(task_id, "worker_failed", f"exit code {rc}")
+        write_budget_end(run_id, f"failed:{rc}")
+    return rc
+
+
+def run_fallback(task_id: str, permission: str, engine: str, previous_log: Path, pretty: bool = True, yes: bool = False) -> int:
+    t = task_by_id(task_id)
+    original_executor = t.get("executor")
+    original_profile = t.get("profile")
+    if engine in {"codex", "gpt"}:
+        t["executor"] = "codex"
+        t["profile"] = "gpt-codex"
+    elif engine in {"antigravity", "agy"}:
+        t["executor"] = "antigravity"
+        t["profile"] = "antigravity-executor"
+    # Write continuation prompt into worktree.
+    wt = create_worktree(task_id)
+    sync_agentops_to_worktree(task_id)
+    continuation = wt / ".agentops" / "fallback-continuation.md"
+    prev_tail = previous_log.read_text(errors="ignore")[-8000:] if previous_log.exists() else ""
+    continuation.write_text(
+        f"""# Fallback continuation for {task_id}
+
+The previous worker could not continue. Continue from the existing worktree and preserve all original scope/safety rules.
+
+## Original prompt
+
+```markdown
+{task_prompt(task_id)}
+```
+
+## Previous log tail
+
+```text
+{prev_tail}
+```
+
+## Worktree state
+
+```text
+{run(['git','status','--short'], cwd=wt, capture=True).stdout}
+{run(['git','diff','--stat'], cwd=wt, capture=True).stdout}
+```
+
+Write final report to `.agentops/reports/{task_id}/report.md`.
+""",
+        encoding="utf-8",
+    )
+    # Temporarily override prompt file in root and worktree by setting a task prompt copy.
+    p = prompt_path(task_id, wt)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(continuation.read_text(encoding="utf-8"), encoding="utf-8")
+    # Override root prompt just for this invocation? Avoid; command builder reads root prompt. Pass temp by replacing root prompt backup.
+    root_prompt = prompt_path(task_id)
+    backup = root_prompt.read_text(encoding="utf-8") if root_prompt.exists() else None
+    root_prompt.write_text(continuation.read_text(encoding="utf-8"), encoding="utf-8")
+    try:
+        rc = run_task_engine(task_id, mode="headless", permission=permission, profile_name=t.get("profile"), pretty=pretty, fallback="pause", yes=True, fallback_on_any=False)
+    finally:
+        if backup is not None:
+            root_prompt.write_text(backup, encoding="utf-8")
+        t["executor"] = original_executor
+        t["profile"] = original_profile
+    return rc
+
+
+def commit_dirty(task_id: str, fallback: bool = False) -> None:
+    wt = wt_for(task_id)
+    if not wt.exists():
+        return
+    r = report_path(task_id, wt)
+    if not r.exists():
+        r.parent.mkdir(parents=True, exist_ok=True)
+        status = run(["git", "status", "--short"], cwd=wt, capture=True).stdout
+        stat = run(["git", "diff", "--stat"], cwd=wt, capture=True).stdout
+        r.write_text(f"# {task_id} report\n\nStatus: completed without explicit report.\n\n## Git status\n\n```text\n{status}\n```\n\n## Diff stat\n\n```text\n{stat}\n```\n", encoding="utf-8")
+    if run(["git", "status", "--short"], cwd=wt, capture=True).stdout.strip():
+        run(["git", "add", "."], cwd=wt, check=True)
+        msg = f"Agent task: {task_id}" if not fallback else f"Agent fallback task: {task_id}"
+        run(["git", "commit", "-m", msg], cwd=wt, check=False)
+    # Copy report to root.
+    dest = report_path(task_id)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if r.exists():
+        shutil.copy2(r, dest)
+
+
+def theme_color(theme: str) -> str:
+    return {"matrix":"32","reactor":"33","satellite":"36","deepsea":"34","arcade":"35","aurora":"95","oracle":"96","noir":"37","solar":"93"}.get(theme, "94")
+
+
+def theme_art(theme: str, tick: int) -> list[str]:
+    if theme == "matrix":
+        glyphs = "01╱╲│╳•◦△◇"
+        return ["".join(random.choice(glyphs) if (i + tick + row) % 5 == 0 else " " for i in range(66)) for row in range(3)]
+    if theme == "reactor":
+        return ["          ╭───────────────╮", "      ╭───┤  CORE ONLINE  ├───╮", "      │   ╰───────┬───────╯   │", "              ◉───◆───◉"]
+    if theme == "arcade":
+        return ["      ┌────────────────────────────┐", "      │  INSERT CONTEXT TO PLAY    │", f"      │  SCORE: {tick * 137 % 999999:06d}            │", "      └────────────────────────────┘"]
+    if theme == "aurora":
+        return ["      ∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿", "        gradient fields aligning", "      ∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿"]
+    # Nebula/default constellation
+    rows = []
+    for row in range(4):
+        line = ""
+        for i in range(58):
+            if (i + row + tick) % 17 == 0:
+                line += "✦"
+            elif (i * (row+1) + tick) % 23 == 0:
+                line += "⋆"
+            elif random.randrange(40) == 0:
+                line += "·"
+            else:
+                line += " "
+        rows.append(line)
+    return rows
+
+
+def run_pretty_subprocess(task_id: str, engine: str, cmd: list[str], log_file: Path) -> int:
+    theme = os.environ.get("AGENTOPS_ANIMATION_THEME") or random.choice(THEMES)
+    spinner = random.choice(SPINNERS)
+    c = theme_color(theme)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    with log_file.open("w", encoding="utf-8") as f:
+        p = subprocess.Popen(cmd, cwd=str(wt_for(task_id)), stdout=f, stderr=subprocess.STDOUT, text=True)
+    start = time.time()
+    tick = 0
+    hide = "\033[?25l"
+    show = "\033[?25h"
+    try:
+        sys.stdout.write(hide)
+        while p.poll() is None:
+            elapsed = int(time.time() - start)
+            frame = spinner[tick % len(spinner)]
+            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.write(f"\033[1;{c}m╔══════════════════════════════════════════════════════════════════════════════╗\033[0m\n")
+            sys.stdout.write(f"\033[1;{c}m║                          ✦ AGENTOPS SWARM ✦                                ║\033[0m\n")
+            sys.stdout.write(f"\033[1;{c}m╠══════════════════════════════════════════════════════════════════════════════╣\033[0m\n")
+            sys.stdout.write(f"║ Task       {task_id:<62}║\n")
+            sys.stdout.write(f"║ Engine     {engine:<62}║\n")
+            sys.stdout.write(f"║ Theme      {theme:<62}║\n")
+            sys.stdout.write(f"║ Status     {frame} running{'':<52}║\n")
+            sys.stdout.write(f"║ Elapsed    {elapsed//60:02d}:{elapsed%60:02d}{'':<57}║\n")
+            sys.stdout.write(f"\033[1;{c}m╠══════════════════════════════════════════════════════════════════════════════╣\033[0m\n")
+            for line in theme_art(theme, tick):
+                sys.stdout.write(f"║  {line[:72]:<72}║\n")
+            sys.stdout.write(f"\033[1;{c}m╠════════════════════════════════════ LOG TAIL ═══════════════════════════════╣\033[0m\n")
+            tail = tail_file(log_file, 20)
+            for line in tail:
+                sys.stdout.write((line[:76] + "\n") if len(line) > 76 else line + "\n")
+            sys.stdout.write(f"\033[1;{c}m╚══════════════════════════════════════════════════════════════════════════════╝\033[0m\n")
+            sys.stdout.write(f"{random.choice(QUOTES)} | log: {log_file}\n")
+            sys.stdout.flush()
+            tick += 1
+            time.sleep(2)
+    finally:
+        sys.stdout.write(show)
+    rc = p.wait()
+    sys.stdout.write("\nFinal output:\n" + "─" * 78 + "\n")
+    for line in tail_file(log_file, 120):
+        print(line)
+    sys.stdout.write("─" * 78 + "\n")
+    return rc
+
+
+def tail_file(path: Path, n: int) -> list[str]:
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(errors="ignore").splitlines()
+        return lines[-n:]
+    except Exception:
+        return []
+
+
+def run_checks(checks: list[str] | None = None) -> tuple[int, str]:
+    cfg = config()
+    cmds = checks or cfg.get("checks") or DEFAULT_CHECKS
+    output = []
+    for cmd in cmds:
+        info(f"check: {cmd}")
+        p = run(cmd, capture=True, check=False)
+        output.append(f"$ {cmd}\n{p.stdout}\n{p.stderr}")
+        if p.returncode != 0:
+            return p.returncode, "\n".join(output)
+    return 0, "\n".join(output)
+
+
+def create_rollback_ref(label: str) -> str:
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    ref = f"agentops/rollback/{label}-{ts}"
+    run(["git", "branch", ref], check=False)
+    event(None, "rollback_ref", ref)
+    return ref
+
+
+def merge_task(task_id: str, auto_repair: bool = False, repair_attempts: int = 1, repair_profile: str = "sonnet-repair", yes: bool = False, run_task_checks: bool = True) -> bool:
+    branch = branch_for(task_id)
+    commit_dirty(task_id)
+    if run(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], check=False).returncode != 0:
+        warn(f"Missing branch {branch}")
+        return False
+    if not run(["git", "diff", "--quiet", f"HEAD..{branch}"], check=False).returncode:
+        ok(f"No changes to merge for {task_id}")
+        return True
+    create_rollback_ref(task_id)
+    info(f"Merging {branch}")
+    rc = run(["git", "merge", "--no-ff", branch, "-m", f"Merge agent task: {task_id}"], check=False).returncode
+    if rc != 0:
+        warn("Merge conflict. Resolve manually or run rollback.")
+        return False
+    if run_task_checks:
+        checks = task_by_id(task_id).get("checks") or None
+        rc, out = run_checks(checks)
+        if rc != 0:
+            log = REPORTS_DIR / "auto-repair" / f"{task_id}-check-failure-{int(time.time())}.log"
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.write_text(out, encoding="utf-8")
+            warn(f"Checks failed after merge. Log: {log}")
+            if auto_repair and repair_attempts > 0:
+                if confirm(f"Spawn repair worker for {task_id}?", default=False, assume_yes=yes):
+                    return repair_and_merge(task_id, log, repair_profile, repair_attempts, yes=yes)
+            return False
+    return True
+
+
+def repair_and_merge(task_id: str, failure_log: Path, repair_profile: str, attempts: int, yes: bool = False) -> bool:
+    for attempt in range(attempts):
+        rid = f"auto-repair-{task_id}-{int(time.time())}-{attempt+1}"
+        a = active()
+        original = task_by_id(task_id)
+        repair_task = normalize_task({
+            "id": rid,
+            "title": f"Auto repair for {task_id}",
+            "tranche": "repair",
+            "priority": "p0",
+            "executor": profile(repair_profile).get("engine", "claude"),
+            "profile": repair_profile,
+            "framework": original.get("framework", "generic"),
+            "allowed_paths": original.get("allowed_paths", []),
+            "locked_paths": original.get("locked_paths", []),
+            "acceptance": ["Fix the failing checks without broad refactors", "Preserve security boundaries"],
+            "checks": original.get("checks", []),
+        })
+        a.setdefault("tasks", []).append(repair_task)
+        save_active(a)
+        prompt = f"""# Auto repair for {task_id}
+
+Fix the failing checks from the integrated branch. Do not add broad features. Do not weaken tests. Preserve security.
+
+## Failure log
+
+```text
+{failure_log.read_text(errors='ignore')[-12000:]}
+```
+
+## Original task acceptance
+
+{json.dumps(original.get('acceptance', []), indent=2)}
+
+Write report to `.agentops/reports/{rid}/report.md`.
+"""
+        pp = prompt_path(rid)
+        pp.parent.mkdir(parents=True, exist_ok=True)
+        pp.write_text(prompt, encoding="utf-8")
+        rc = run_task_engine(rid, mode="headless", permission="workspace", profile_name=repair_profile, pretty=True, fallback="ask", yes=yes, fallback_on_any=True)
+        if rc == 0:
+            if merge_task(rid, auto_repair=False, run_task_checks=True, yes=yes):
+                return True
+    return False
+
+
+def collect_reports() -> None:
+    ensure_dirs()
+    lines = ["# AgentOps Tranche Report", "", f"Generated: {now_iso()}", ""]
+    for t in tasks():
+        task_id = t.get("id")
+        wt = wt_for(task_id)
+        src = report_path(task_id, wt)
+        dest = report_path(task_id)
+        if src.exists():
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+        status = "report" if dest.exists() else "no-report"
+        dirty = "dirty" if wt.exists() and run(["git","status","--short"], cwd=wt, capture=True).stdout.strip() else "clean" if wt.exists() else "no-worktree"
+        lines.append(f"- `{task_id}`: {dirty}, {status}")
+    (REPORTS_DIR / "TRANCHE_REPORT.md").write_text("\n".join(lines)+"\n", encoding="utf-8")
+    print(REPORTS_DIR / "TRANCHE_REPORT.md")
+
+
+def examples_index() -> None:
+    ex = AGENTOPS_DIR / "examples"
+    ex.mkdir(parents=True, exist_ok=True)
+    lines = ["# AgentOps Examples Index", "", f"Generated: {now_iso()}", ""]
+    forbidden = re.compile(r"token|secret|credential|client_secret|private|\.env", re.I)
+    for p in sorted(ex.rglob("*")):
+        if p.is_dir():
+            continue
+        rel = p.relative_to(ex)
+        if forbidden.search(str(rel)):
+            continue
+        size = p.stat().st_size
+        lines.append(f"## `{rel}`")
+        lines.append(f"- size: {size} bytes")
+        if p.suffix.lower() in {".md", ".txt", ".html", ".css", ".json", ".yaml", ".yml"} and size < 200_000:
+            txt = p.read_text(errors="ignore")[:1600]
+            lines.append("\n```text\n" + txt + "\n```\n")
+        else:
+            lines.append("")
+    (ex / "GENERATED_INDEX.md").write_text("\n".join(lines), encoding="utf-8")
+    print(ex / "GENERATED_INDEX.md")
+
+
+# Commands
 
 def cmd_init(args: argparse.Namespace) -> None:
-    ensure_dirs()
-    cfg = default_config()
-    cfg["project_name"] = args.name or repo_root().name
-    cfg["project_root"] = str(repo_root())
-    if config_path().exists() and not args.force:
-        print(f"{config_path()} already exists. Use --force to overwrite.")
-    else:
-        save_config(cfg)
-    if not active_path().exists() or args.force:
-        save_active({"version": 1, "project": cfg["project_name"], "created_at": utc_now(), "tasks": []})
-    (app_root() / "examples" / "README.md").write_text(EXAMPLES_README, encoding="utf-8")
-    log_event("init", project=cfg["project_name"], root=str(repo_root()))
-    print(f"Initialized AgentOps in {app_root()}")
+    ensure_init(args.name, force=args.force)
+    ok(f"AgentOps initialized for {args.name or ROOT.name}")
 
 
 def cmd_doctor(args: argparse.Namespace) -> None:
-    root = repo_root()
-    print(f"AgentOps Swarm {VERSION}")
-    print(f"Root: {root}")
-    for name, cmd in [
-        ("git", ["git", "--version"]),
-        ("python", [sys.executable, "--version"]),
-        ("claude", ["claude", "--version"]),
-        ("codex", ["codex", "--version"]),
-        ("agy", ["agy", "--version"]),
-        ("antigravity", ["antigravity", "--version"]),
-        ("tmux", ["tmux", "-V"]),
-    ]:
-        exe = shutil.which(cmd[0])
-        if not exe:
-            print(f"✗ {name}: not found")
-            continue
-        try:
-            out = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT).strip().splitlines()[0]
-            print(f"✓ {name}: {out}")
-        except Exception as e:
-            print(f"? {name}: found at {exe}, version check failed: {e}")
-    if not app_root().exists():
-        print("✗ .agentops not initialized. Run: agentops init")
-    else:
-        print("✓ .agentops initialized")
-    issues = []
-    for task in load_active().get("tasks", []):
-        issues.extend(check_task_safety(task))
-    if issues:
-        print("Safety issues:")
-        for issue in issues:
-            print(f"  - {issue}")
-    else:
-        print("✓ task path grants look safe")
+    print(f"AgentOps {__version__}")
+    print(f"Project: {ROOT}")
+    for exe in ["git", "python3", "claude", "codex", "agy", "tmux", "gnome-terminal"]:
+        path = shutil.which(exe)
+        print(f"{exe:16} {path or 'missing'}")
+    if ACTIVE_PATH.exists():
+        print(f"tasks: {len(tasks())}")
+    if not shutil.which("claude"):
+        warn("Claude Code missing. Install/authenticate before using Claude profiles.")
+    if not shutil.which("codex"):
+        warn("Codex missing. Install/authenticate before using GPT/Codex fallback.")
+    if not shutil.which("agy"):
+        warn("Antigravity missing. Antigravity fallback will be unavailable.")
+
+
+def cmd_profiles(args: argparse.Namespace) -> None:
+    for k, v in config().get("profiles", {}).items():
+        print(f"{k}: {json.dumps(v)}" if args.verbose else k)
+
+
+def cmd_templates(args: argparse.Namespace) -> None:
+    base = TEMPLATES_DIR
+    if args.sub == "list":
+        for p in sorted(base.rglob("*.md")):
+            print(p.relative_to(base))
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    for t in tasks():
+        wt = wt_for(t["id"])
+        wt_state = "worktree" if wt.exists() else "no-worktree"
+        dirty = "dirty" if wt.exists() and run(["git","status","--short"], cwd=wt, capture=True).stdout.strip() else ""
+        rep = "report" if report_path(t["id"]).exists() or report_path(t["id"], wt).exists() else "no-report"
+        print(f"{t['id']:<36} t{str(t.get('tranche','')):<4} {t.get('priority',''):<3} {t.get('executor',''):<12} {wt_state:<12} {dirty:<7} {rep}")
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    cmd_list(args)
 
 
 def cmd_add_task(args: argparse.Namespace) -> None:
-    ensure_dirs()
-    active = load_active()
-    task = {
+    require_init()
+    a = active()
+    raw = {
         "id": args.id,
         "title": args.title or args.id,
         "tranche": args.tranche,
         "priority": args.priority,
         "executor": args.executor,
-        "profile": args.profile,
+        "profile": args.profile or profile_for_executor(args.executor),
         "framework": args.framework,
         "allowed_paths": args.allowed_path or [],
         "locked_paths": args.locked_path or [],
         "acceptance": args.acceptance or [],
         "checks": args.check or [],
-        "branch": branch_name(args.id),
     }
-    issues = check_task_safety(task)
-    if issues and not args.force:
-        raise SystemExit("Refusing unsafe task:\n" + "\n".join(issues) + "\nUse --force only if you understand the risk.")
-    active["tasks"] = [t for t in active.get("tasks", []) if t.get("id") != args.id] + [task]
-    save_active(active)
-    prompt = write_task_prompt(task)
-    log_event("task.added", task_id=args.id, tranche=args.tranche, executor=args.executor)
-    print(f"Added task {args.id}")
-    print(f"Prompt: {prompt}")
+    nt = normalize_task(raw)
+    a["tasks"] = [t for t in a.get("tasks", []) if t.get("id") != nt["id"]] + [nt]
+    save_active(a)
+    prompt_path(nt["id"]).write_text(generate_prompt_from_task(nt), encoding="utf-8")
+    ok(f"Added task {nt['id']}")
 
 
-def cmd_list(args: argparse.Namespace) -> None:
-    active = load_active()
-    for task in sorted(active.get("tasks", []), key=lambda t: (t.get("tranche", 999), t.get("priority", "p9"), t.get("id", ""))):
-        wt = task_worktree(task["id"])
-        wt_state = "worktree" if wt.exists() else "no-worktree"
-        report = app_root() / "reports" / task["id"] / "report.md"
-        print(f"{task['id']:<32} t{task.get('tranche','?'):<3} {task.get('priority',''):<3} {task.get('executor',''):<12} {wt_state:<12} {'report' if report.exists() else 'no-report'}")
+def cmd_prompt(args: argparse.Namespace) -> None:
+    task_by_id(args.task)
+    p = prompt_path(args.task)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if args.file:
+        p.write_text(Path(args.file).read_text(encoding="utf-8"), encoding="utf-8")
+    elif args.stdin:
+        p.write_text(sys.stdin.read(), encoding="utf-8")
+    elif args.edit:
+        if not p.exists():
+            p.write_text(task_prompt(args.task), encoding="utf-8")
+        editor = os.environ.get("EDITOR", "nano")
+        subprocess.run([editor, str(p)])
+    else:
+        print("Paste prompt. End with a line containing only: EOF")
+        lines = []
+        while True:
+            line = input()
+            if line == "EOF":
+                break
+            lines.append(line)
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    ok(f"Prompt saved: {p}")
 
 
-def cmd_status(args: argparse.Namespace) -> None:
-    active = load_active()
-    for task in active.get("tasks", []):
-        tid = task["id"]
-        wt = task_worktree(tid)
-        status = "no-worktree"
-        dirty = ""
-        if wt.exists():
-            status = "worktree"
-            try:
-                out = subprocess.check_output(["git", "status", "--short"], cwd=wt, text=True)
-                dirty = "dirty" if out.strip() else "clean"
-            except Exception:
-                dirty = "?"
-        report_root = app_root() / "reports" / tid / "report.md"
-        report_wt = wt / APP_DIR / "reports" / tid / "report.md"
-        report = "report" if report_root.exists() or report_wt.exists() else "no-report"
-        print(f"{tid:<32} {task.get('priority',''):<3} {status:<12} {dirty:<7} {report:<10} {branch_name(tid)}")
+def planner_prompt(overview: str, tranches: int) -> str:
+    return f"""You are an Opus-level project planner for AgentOps Swarm.
+
+Create a narrow, executable multi-agent DAG for this project. Output ONLY JSON with this schema:
+
+{{
+  "tasks": [
+    {{
+      "id": "kebab-case",
+      "title": "short title",
+      "tranche": 1,
+      "priority": "p0|p1|p2",
+      "executor": "claude|codex|antigravity",
+      "profile": "sonnet-executor|gpt-codex|codex-verifier|antigravity-executor",
+      "framework": "generic|vue-quasar|react|fastapi|python|docker-compose|ci|docs|qa",
+      "allowed_paths": ["path"],
+      "locked_paths": ["path"],
+      "acceptance": ["criterion"],
+      "checks": ["command"]
+    }}
+  ]
+}}
+
+Rules:
+- Create {tranches} tranches.
+- Keep each task bounded and mergeable.
+- Include QA tasks after implementation tranches.
+- Avoid secrets/runtime paths.
+- Include checks.
+
+Project overview:
+
+{overview}
+"""
 
 
-def cmd_create_worktree(args: argparse.Namespace) -> None:
-    task = task_by_id(args.task_id)
-    wt = task_worktree(task["id"])
-    branch = branch_name(task["id"])
-    if wt.exists() and not args.force:
-        print(f"Worktree already exists: {wt}")
-        return
-    if wt.exists():
-        run(["git", "worktree", "remove", "--force", str(wt)], check=False)
-        shutil.rmtree(wt, ignore_errors=True)
-    run(["git", "branch", "-D", branch], check=False)
-    run(["git", "worktree", "add", str(wt), "-b", branch])
-    write_task_prompt(task)
-    log_event("worktree.created", task_id=task["id"], path=str(wt), branch=branch)
-    print(f"Created {wt} on {branch}")
-
-
-def cmd_clean(args: argparse.Namespace) -> None:
-    ids = args.task_id or [t["id"] for t in load_active().get("tasks", []) if args.tranche is None or t.get("tranche") == args.tranche]
-    for tid in ids:
-        wt = task_worktree(tid)
-        br = branch_name(tid)
-        run(["git", "worktree", "remove", "--force", str(wt)], check=False)
-        shutil.rmtree(wt, ignore_errors=True)
-        if args.branches:
-            run(["git", "branch", "-D", br], check=False)
-        if args.reports:
-            shutil.rmtree(app_root() / "reports" / tid, ignore_errors=True)
-        log_event("task.cleaned", task_id=tid)
-        print(f"Cleaned {tid}")
-    run(["git", "worktree", "prune"], check=False)
-
-
-def engine_for_task(task: dict[str, Any]) -> str:
-    profile = task.get("profile")
-    cfg = load_config()
-    if profile and profile in cfg.get("model_profiles", {}):
-        return cfg["model_profiles"][profile].get("engine") or task.get("executor", "claude")
-    return task.get("executor", "claude")
-
-
-def model_for_profile(profile: str | None) -> str:
-    if not profile:
-        return ""
-    return str(load_config().get("model_profiles", {}).get(profile, {}).get("model", ""))
-
-
-def prompt_file_for_task(task_id: str) -> Path:
-    task = task_by_id(task_id)
-    path = app_root() / "tasks" / f"{task_id}.prompt.md"
-    if not path.exists():
-        path = write_task_prompt(task)
-    return path
-
-
-def command_for_task(task: dict[str, Any], mode: str, permission: str) -> list[str]:
-    engine = engine_for_task(task)
-    tid = task["id"]
-    wt = task_worktree(tid)
-    prompt = prompt_file_for_task(tid)
-    return [sys.executable, "-m", "agentops_swarm.cli", "_run-task", tid, "--engine", engine, "--mode", mode, "--permission", permission, "--worktree", str(wt), "--prompt", str(prompt)]
-
-
-def agy_executable() -> str | None:
-    return shutil.which("agy") or shutil.which("antigravity")
-
-
-def cmd_run_task_internal(args: argparse.Namespace) -> None:
-    tid = args.task_id
-    engine = args.engine
-    mode = args.mode
-    permission = args.permission
-    wt = Path(args.worktree)
-    prompt = Path(args.prompt)
-    wt.mkdir(parents=True, exist_ok=True)
-    report_dir = wt / APP_DIR / "reports" / tid
-    report_dir.mkdir(parents=True, exist_ok=True)
-    os.chdir(wt)
-    log_event("task.run.start", task_id=tid, engine=engine, mode=mode, permission=permission)
-    rid = budget_start(tid, engine, mode)
-    rc = 0
-    try:
-        prompt_text = prompt.read_text(encoding="utf-8")
-        if engine == "claude":
-            profile = task_by_id(tid).get("profile", "sonnet-executor")
-            model = model_for_profile(profile)
-            cmd = ["claude"]
-            if model:
-                cmd += ["--model", model]
-            if mode == "headless":
-                if permission == "full":
-                    cmd += ["--permission-mode", "bypassPermissions"]
-                cmd += ["-p", prompt_text]
-                rc = subprocess.call(cmd)
-            else:
-                print(f"Paste or ask Claude to read: {prompt}")
-                if permission == "full":
-                    cmd += ["--permission-mode", "bypassPermissions"]
-                rc = subprocess.call(cmd)
-        elif engine == "codex":
-            cmd = ["codex"]
-            if mode == "headless":
-                cmd.append("exec")
-                if permission == "full":
-                    cmd.append("--dangerously-bypass-approvals-and-sandbox")
-                else:
-                    cmd += ["--sandbox", "workspace-write"]
-                cmd += ["--cd", str(wt), prompt_text]
-                rc = subprocess.call(cmd)
-            else:
-                print(f"Paste or ask Codex to read: {prompt}")
-                if permission == "full":
-                    cmd.append("--dangerously-bypass-approvals-and-sandbox")
-                else:
-                    cmd += ["--sandbox", "workspace-write"]
-                cmd += ["--cd", str(wt)]
-                rc = subprocess.call(cmd)
-        elif engine == "antigravity":
-            exe = agy_executable()
-            if not exe:
-                print("Antigravity CLI not found. Expected `agy` or `antigravity`.")
-                rc = 127
-            elif mode == "headless":
-                # AGY is primarily a TUI. Try a practical stdin-driven /goal invocation.
-                # Users can override with AGENTOPS_ANTIGRAVITY_COMMAND_TEMPLATE.
-                tmpl = os.environ.get("AGENTOPS_ANTIGRAVITY_COMMAND_TEMPLATE")
-                if tmpl:
-                    command = tmpl.replace("{prompt}", prompt_text).replace("{worktree}", str(wt)).replace("{prompt_file}", str(prompt))
-                    rc = subprocess.call(command, shell=True, cwd=wt)
-                else:
-                    print("Launching Antigravity TUI with /goal piped. If your AGY version requires interactive auth, use --mode interactive.")
-                    p = subprocess.Popen([exe], cwd=wt, stdin=subprocess.PIPE, text=True)
-                    assert p.stdin is not None
-                    p.stdin.write("/goal " + prompt_text.replace("\n", " ") + "\n")
-                    p.stdin.close()
-                    rc = p.wait()
-            else:
-                print(f"Starting Antigravity. Paste or use /goal with: {prompt}")
-                rc = subprocess.call([exe], cwd=wt)
-        else:
-            print(f"Unknown engine: {engine}")
-            rc = 2
-    finally:
-        budget_end(rid)
-    if rc != 0:
-        report = report_dir / "report.md"
-        report.write_text(f"# {tid} report\n\nStatus: FAILED\n\nAgent exited with code {rc}.\n\n", encoding="utf-8")
-        log_event("task.run.failed", task_id=tid, rc=rc)
-        raise SystemExit(rc)
-    report = report_dir / "report.md"
-    if not report.exists():
-        report.write_text(f"# {tid} report\n\nStatus: COMPLETED_WITHOUT_EXPLICIT_REPORT\n\n", encoding="utf-8")
-    if subprocess.call(["git", "status", "--short"], stdout=subprocess.PIPE, text=True) == 0:
-        out = subprocess.check_output(["git", "status", "--short"], text=True)
-        if out.strip():
-            subprocess.call(["git", "add", "."])
-            subprocess.call(["git", "commit", "-m", f"Agent task: {tid}"])
-    log_event("task.run.complete", task_id=tid, engine=engine)
-
-
-def spawn_terminal(title: str, cmd: list[str], terminal: str = "auto") -> None:
-    command = " ".join(shlex_quote(c) for c in cmd)
-    root = repo_root()
-    wrapped = f"cd {shlex_quote(str(root))} && {command}; echo; read -r -p 'Press Enter to close...'"
-    log_event("terminal.spawn", title=title, terminal=terminal, command=command)
-    if terminal == "current":
-        subprocess.call(wrapped, shell=True)
-        return
-    if terminal == "tmux" or (terminal == "auto" and not any(shutil.which(x) for x in ["gnome-terminal", "x-terminal-emulator", "kgx", "konsole", "xfce4-terminal", "kitty", "alacritty", "xterm"])):
-        if not shutil.which("tmux"):
-            print("No GUI terminal and tmux not found. Command:")
-            print(wrapped)
+def cmd_plan(args: argparse.Namespace) -> None:
+    require_init()
+    overview = Path(args.overview).read_text(encoding="utf-8") if args.overview else sys.stdin.read()
+    prompt_text = planner_prompt(overview, args.tranches)
+    out_path = AGENTOPS_DIR / "planner" / f"plan-{int(time.time())}.json"
+    out_path.parent.mkdir(exist_ok=True)
+    if args.run:
+        prof = profile(args.profile or "opus-planner")
+        model = prof.get("model", "opus")
+        cmd = ["claude", "--model", model, "-p", prompt_text]
+        info("Running planner model")
+        p = subprocess.run(cmd, text=True, capture_output=True)
+        raw = p.stdout.strip() or p.stderr.strip()
+        (out_path.with_suffix(".raw.txt")).write_text(raw, encoding="utf-8")
+        try:
+            m = re.search(r"\{.*\}", raw, re.S)
+            data = json.loads(m.group(0) if m else raw)
+        except Exception as exc:
+            warn(f"Could not parse planner JSON: {exc}. Raw saved to {out_path.with_suffix('.raw.txt')}")
             return
-        subprocess.call(["tmux", "new-session", "-d", "-s", "agentops"], stderr=subprocess.DEVNULL)
-        subprocess.call(["tmux", "new-window", "-t", "agentops", "-n", title[:18], "bash", "-lc", wrapped])
-        print("Started tmux window. Attach: tmux attach -t agentops")
-        return
-    options = []
-    if terminal in ("auto", "gnome") and shutil.which("gnome-terminal"):
-        options = ["gnome-terminal", "--title", title, "--", "bash", "-lc", wrapped]
-    elif terminal in ("auto", "x-terminal-emulator") and shutil.which("x-terminal-emulator"):
-        options = ["x-terminal-emulator", "-T", title, "-e", "bash", "-lc", wrapped]
-    elif terminal in ("auto", "kgx") and shutil.which("kgx"):
-        options = ["kgx", "--title", title, "--", "bash", "-lc", wrapped]
-    elif terminal in ("auto", "konsole") and shutil.which("konsole"):
-        options = ["konsole", "--new-tab", "--title", title, "-e", "bash", "-lc", wrapped]
-    elif terminal in ("auto", "xfce4-terminal") and shutil.which("xfce4-terminal"):
-        options = ["xfce4-terminal", "--title", title, "--command", f"bash -lc {shlex_quote(wrapped)}"]
-    elif terminal in ("auto", "kitty") and shutil.which("kitty"):
-        options = ["kitty", "--title", title, "bash", "-lc", wrapped]
-    elif terminal in ("auto", "alacritty") and shutil.which("alacritty"):
-        options = ["alacritty", "--title", title, "-e", "bash", "-lc", wrapped]
-    elif terminal in ("auto", "xterm") and shutil.which("xterm"):
-        options = ["xterm", "-T", title, "-e", "bash", "-lc", wrapped]
     else:
-        print("No supported terminal found. Command:")
-        print(wrapped)
+        print(prompt_text)
         return
-    subprocess.Popen(options)
+    import_tasks(data, overwrite=args.overwrite)
+    save_json(out_path, data)
+    ok(f"Imported planner tasks; saved {out_path}")
 
 
-def shlex_quote(s: str) -> str:
-    import shlex
-    return shlex.quote(s)
+def import_tasks(data: dict[str, Any], overwrite: bool = False) -> None:
+    a = active()
+    existing = {t.get("id"): t for t in a.get("tasks", [])}
+    for raw in data.get("tasks", []):
+        nt = normalize_task(raw)
+        if nt["id"] in existing and not overwrite:
+            continue
+        existing[nt["id"]] = nt
+        prompt_path(nt["id"]).write_text(generate_prompt_from_task(nt), encoding="utf-8")
+    a["tasks"] = list(existing.values())
+    save_active(a)
 
 
-def selected_tasks(tranche: int | None = None, task_ids: list[str] | None = None) -> list[dict[str, Any]]:
-    tasks = load_active().get("tasks", [])
-    if task_ids:
-        wanted = set(task_ids)
-        tasks = [t for t in tasks if t.get("id") in wanted]
-    if tranche is not None:
-        tasks = [t for t in tasks if int(t.get("tranche", 0)) == tranche]
-    return tasks
-
-
-def cmd_launch(args: argparse.Namespace) -> None:
-    tasks = selected_tasks(args.tranche, args.task_id)
-    for task in tasks:
-        if not task_worktree(task["id"]).exists():
-            cmd_create_worktree(argparse.Namespace(task_id=task["id"], force=False))
-    for task in tasks:
-        cmd = command_for_task(task, args.mode, args.permission)
-        if args.spawn:
-            spawn_terminal(f"agent:{task['id']}", cmd, args.terminal)
-        else:
-            print(" ".join(shlex_quote(c) for c in cmd))
-    if args.monitor:
-        monitor_cmd = [sys.executable, "-m", "agentops_swarm.cli", "tui"] if args.tui else [sys.executable, "-m", "agentops_swarm.cli", "status"]
-        if args.spawn:
-            spawn_terminal("agentops:monitor", monitor_cmd, args.terminal)
-
-
-def cmd_run_task(args: argparse.Namespace) -> None:
-    task = task_by_id(args.task_id)
-    if not task_worktree(args.task_id).exists():
-        cmd_create_worktree(argparse.Namespace(task_id=args.task_id, force=False))
-    engine = args.engine or engine_for_task(task)
-    cmd = [sys.executable, "-m", "agentops_swarm.cli", "_run-task", args.task_id, "--engine", engine, "--mode", args.mode, "--permission", args.permission, "--worktree", str(task_worktree(args.task_id)), "--prompt", str(prompt_file_for_task(args.task_id))]
-    if args.spawn:
-        spawn_terminal(f"agent:{args.task_id}", cmd, args.terminal)
-    else:
-        raise SystemExit(subprocess.call(cmd))
+def cmd_import_plan(args: argparse.Namespace) -> None:
+    data = load_json(Path(args.file), {})
+    import_tasks(data, overwrite=args.overwrite)
+    ok("Plan imported")
 
 
 def cmd_scout(args: argparse.Namespace) -> None:
-    tasks = selected_tasks(args.tranche, [args.task_id] if args.task_id else None)
-    profile = args.profile or "haiku-scout"
-    model = model_for_profile(profile)
-    for task in tasks:
-        tid = task["id"]
-        scout_file = app_root() / "scouts" / f"{tid}.md"
-        prompt = f"""
-You are a read-only scout for AgentOps.
-Task: {tid} - {task.get('title','')}
-Allowed paths: {task.get('allowed_paths', [])}
-Acceptance criteria: {task.get('acceptance', [])}
+    selected = tasks_for_selector([args.task] if args.task else None, str(args.tranche) if args.tranche else None, args.all)
+    for t in selected:
+        task_id = t["id"]
+        prof = profile(args.profile or "haiku-scout")
+        prompt = f"""You are a read-only scout. Inspect the repository for task `{task_id}`.
 
-Inspect the repository without editing. Produce:
-1. relevant files
-2. likely implementation points
-3. risks/conflicts
-4. tests to run
-5. suggested executor instructions
+Task prompt:
 
-Write the report to: {scout_file}
-Do not read .env, secrets, data, backups, logs, credentials, or tokens.
-""".strip()
-        cmd = ["claude"]
-        if model:
-            cmd += ["--model", model]
-        cmd += ["-p", prompt]
-        log_event("scout.start", task_id=tid, profile=profile)
-        rc = subprocess.call(cmd, cwd=repo_root())
-        log_event("scout.complete" if rc == 0 else "scout.failed", task_id=tid, rc=rc)
-        print(f"Scout requested for {tid}. Report should be: {scout_file}")
-
-
-def run_project_checks(label: str, extra: list[str] | None = None) -> tuple[bool, Path]:
-    ensure_dirs()
-    log = app_root() / "reports" / "auto-repair" / f"{label}-{int(time.time())}.log"
-    log.parent.mkdir(parents=True, exist_ok=True)
-    cfg = load_config()
-    checks = extra or cfg.get("checks") or DEFAULT_CHECKS
-    success = True
-    with log.open("w", encoding="utf-8") as f:
-        for check in checks:
-            f.write(f"$ {check}\n")
-            f.flush()
-            proc = subprocess.run(check, cwd=repo_root(), shell=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            f.write(proc.stdout)
-            f.write(f"\n[exit {proc.returncode}]\n")
-            f.flush()
-            if proc.returncode != 0:
-                success = False
-                break
-    return success, log
-
-
-def create_repair_task(label: str, failed_log: Path, failed_command: str, profile: str) -> str:
-    tid = f"auto-repair-{label}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-    task = {
-        "id": tid,
-        "title": f"Auto repair {label}",
-        "tranche": 999,
-        "priority": "p0",
-        "executor": "claude",
-        "profile": profile,
-        "framework": "qa",
-        "allowed_paths": ["."],
-        "locked_paths": [],
-        "acceptance": ["Fix concrete failing checks", "Do not broaden scope"],
-        "checks": [],
-        "branch": branch_name(tid),
-    }
-    active = load_active()
-    active["tasks"].append(task)
-    save_active(active)
-    prompt = f"""
-# Auto repair task: {label}
-
-Fix only the concrete failure shown below. Do not add broad features. Do not weaken tests unless the test is clearly wrong; if changed, preserve the intended invariant.
-
-Failed command/check label: {failed_command}
-
-Failure log excerpt:
-```text
-{failed_log.read_text(encoding='utf-8', errors='replace')[-12000:]}
+```markdown
+{task_prompt(task_id)}
 ```
 
-Safety:
-- Do not read or modify .env, secrets, data, backups, logs, credentials, tokens, or private keys.
-- Do not push.
-- Keep changes focused.
-- Write report to `.agentops/reports/{tid}/report.md`.
-""".strip() + "\n"
-    p = app_root() / "tasks" / f"{tid}.prompt.md"
-    p.write_text(prompt, encoding="utf-8")
-    cmd_create_worktree(argparse.Namespace(task_id=tid, force=False))
-    return tid
+Produce a concise report with:
+- relevant files
+- existing implementation
+- gaps
+- risks/conflicts
+- suggested implementation steps
+- tests to run
+
+Do not edit files. Write report to `.agentops/scouts/{task_id}.md`.
+"""
+        out = SCOUTS_DIR / f"{task_id}.md"
+        cmd = ["claude", "--model", prof.get("model", "haiku"), "-p", prompt]
+        p = subprocess.run(cmd, text=True, capture_output=True)
+        out.write_text(p.stdout or p.stderr, encoding="utf-8")
+        print(f"Scout report: {out}")
 
 
-def cmd_merge(args: argparse.Namespace) -> None:
-    tasks = selected_tasks(args.tranche, args.task_id)
-    for task in tasks:
-        tid = task["id"]
-        wt = task_worktree(tid)
-        branch = branch_name(tid)
-        if wt.exists():
-            out = subprocess.check_output(["git", "status", "--short"], cwd=wt, text=True)
-            if out.strip():
-                subprocess.call(["git", "add", "."], cwd=wt)
-                subprocess.call(["git", "commit", "-m", f"Agent task: {tid}"], cwd=wt)
-        current = subprocess.check_output(["git", "branch", "--show-current"], text=True).strip()
-        diff = subprocess.call(["git", "diff", "--quiet", f"{current}..{branch}"], cwd=repo_root())
-        if diff == 0:
-            print(f"No changes to merge for {tid}")
-            continue
-        print(f"Merging {branch}")
-        subprocess.check_call(["git", "merge", "--no-ff", branch, "-m", f"Merge agent task: {tid}"], cwd=repo_root())
-        if args.checks:
-            ok, log = run_project_checks(tid)
-            attempt = 0
-            while not ok and args.auto_repair and attempt < args.repair_attempts:
-                print(f"Checks failed after {tid}; spawning repair node. Log: {log}")
-                repair_tid = create_repair_task(tid, log, "project checks", args.repair_profile)
-                subprocess.check_call(command_for_task(task_by_id(repair_tid), "headless", args.permission), cwd=repo_root())
-                subprocess.check_call(["git", "merge", "--no-ff", branch_name(repair_tid), "-m", f"Merge auto repair for {tid}"], cwd=repo_root())
-                ok, log = run_project_checks(f"{tid}-repair-{attempt}")
-                attempt += 1
-            if not ok:
-                raise SystemExit(f"Checks failed after {tid}. See {log}")
-    collect_reports()
+def cmd_run(args: argparse.Namespace) -> None:
+    task_by_id(args.task)
+    if args.spawn:
+        cmd = f"cd {shlex.quote(str(ROOT))} && agentops run {shlex.quote(args.task)} --mode {shlex.quote(args.mode)} --permission {shlex.quote(args.permission)} --fallback {shlex.quote(args.fallback)} {'--yes' if args.yes else ''} {'--fallback-on-any-failure' if args.fallback_on_any_failure else ''}; echo; read -r -p 'Press Enter to close...'"
+        spawn_terminal(f"agent:{args.task}", cmd, args.terminal)
+        return
+    rc = run_task_engine(args.task, args.mode, args.permission, profile_name=args.profile, pretty=not args.no_pretty, fallback=args.fallback, yes=args.yes, fallback_on_any=args.fallback_on_any_failure)
+    raise SystemExit(0 if rc in {0, 75, 76} else rc)
 
 
-def collect_reports() -> None:
-    ensure_dirs()
-    report_root = app_root() / "reports"
-    for wt in worktree_root().glob("*"):
-        src = wt / APP_DIR / "reports"
-        if not src.exists():
-            continue
-        for report in src.glob("*/report.md"):
-            dest = report_root / report.parent.name / "report.md"
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(report, dest)
-    lines = ["# AgentOps tranche report", "", f"Generated: {utc_now()}", ""]
-    for task in load_active().get("tasks", []):
-        tid = task["id"]
-        rp = report_root / tid / "report.md"
-        status = "report" if rp.exists() else "no-report"
-        lines.append(f"- `{tid}`: {status}")
-    out = report_root / "TRANCHE_REPORT.md"
-    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(out)
-    log_event("reports.collected", path=str(out))
+def cmd_launch(args: argparse.Namespace) -> None:
+    selected = tasks_for_selector(args.task, str(args.tranche) if args.tranche is not None else None, args.all)
+    if not selected:
+        fail("No tasks selected")
+    max_parallel = args.max_parallel or config().get("defaults", {}).get("max_parallel", 3)
+    if len(selected) > max_parallel and not args.yes:
+        if not confirm(f"Launch {len(selected)} tasks? Recommended max is {max_parallel}.", default=False):
+            return
+    for t in selected:
+        task_id = t["id"]
+        if args.clean_first:
+            remove_worktree(task_id, yes=True)
+        create_worktree(task_id)
+        cmd = f"cd {shlex.quote(str(ROOT))} && agentops run {shlex.quote(task_id)} --mode {shlex.quote(args.mode)} --permission {shlex.quote(args.permission)} --fallback {shlex.quote(args.fallback)} {'--yes' if args.yes else ''} {'--fallback-on-any-failure' if args.fallback_on_any_failure else ''}; echo; read -r -p 'Press Enter to close...'"
+        if args.spawn:
+            spawn_terminal(f"agent:{task_id}", cmd, args.terminal)
+        else:
+            print(cmd)
+    if args.monitor:
+        spawn_terminal("agentops:tui", f"cd {shlex.quote(str(ROOT))} && agentops tui", args.terminal)
 
 
 def cmd_collect(args: argparse.Namespace) -> None:
     collect_reports()
 
 
+def cmd_merge(args: argparse.Namespace) -> None:
+    selected = tasks_for_selector(args.task, str(args.tranche) if args.tranche is not None else None, args.all)
+    for t in selected:
+        if not merge_task(t["id"], auto_repair=args.auto_repair, repair_attempts=args.repair_attempts, repair_profile=args.repair_profile, yes=args.yes):
+            fail(f"Merge failed/stopped at {t['id']}")
+    ok("Merge completed")
+
+
+def cmd_clean(args: argparse.Namespace) -> None:
+    selected = tasks_for_selector(args.task, str(args.tranche) if args.tranche is not None else None, args.all)
+    for t in selected:
+        remove_worktree(t["id"], remove_branch=not args.keep_branch, yes=args.yes or args.force)
+    if args.prune:
+        run(["git", "worktree", "prune"], check=False)
+
+
+def cmd_retry(args: argparse.Namespace) -> None:
+    selected = tasks_for_selector([args.task], None, False)
+    for t in selected:
+        remove_worktree(t["id"], remove_branch=True, yes=True)
+        create_worktree(t["id"])
+        rc = run_task_engine(t["id"], args.mode, args.permission, pretty=not args.no_pretty, fallback=args.fallback, yes=args.yes, fallback_on_any=args.fallback_on_any_failure)
+        if rc not in {0, 75, 76}:
+            raise SystemExit(rc)
+
+
 def cmd_events(args: argparse.Namespace) -> None:
-    if not event_path().exists():
+    if not EVENTS_PATH.exists():
         return
-    lines = event_path().read_text(encoding="utf-8").splitlines()[-args.tail:]
-    for line in lines:
-        if args.json:
-            print(line)
-        else:
+    lines = EVENTS_PATH.read_text(encoding="utf-8").splitlines()
+    tail = lines[-args.tail:] if args.tail else lines
+    if args.json:
+        print("\n".join(tail))
+    else:
+        for line in tail:
             try:
-                obj = json.loads(line)
-                print(f"{obj.get('ts')} {obj.get('kind')} { {k:v for k,v in obj.items() if k not in ('ts','kind')} }")
+                r = json.loads(line)
+                print(f"{r.get('ts')} {r.get('task') or '-':<32} {r.get('type'):<20} {r.get('message')}")
             except Exception:
                 print(line)
 
 
 def cmd_budget(args: argparse.Namespace) -> None:
-    data = budget_load()
-    print(f"Total seconds: {data.get('total_seconds', 0)}")
-    print("By task:")
-    for tid, sec in sorted(data.get("by_task", {}).items(), key=lambda x: -x[1]):
-        print(f"  {tid:<40} {sec:>8}s")
-    print("Recent runs:")
-    for r in data.get("runs", [])[-20:]:
-        print(f"  {r.get('task_id'):<32} {r.get('engine',''):<12} {r.get('seconds')}s {r.get('started_at')}")
-
-
-def cmd_profiles(args: argparse.Namespace) -> None:
-    profiles = load_config().get("model_profiles", {})
-    for name, prof in profiles.items():
-        if args.verbose:
-            print(f"{name}: {json.dumps(prof, ensure_ascii=False)}")
-        else:
-            print(f"{name:<22} {prof.get('engine',''):<12} {prof.get('model','')}")
-
-
-def cmd_templates(args: argparse.Namespace) -> None:
-    if args.sub == "list":
-        td = template_dir()
-        for p in sorted(td.glob("**/*.md")):
-            print(p.relative_to(td))
-
-
-def cmd_plan(args: argparse.Namespace) -> None:
-    ensure_dirs()
-    overview = Path(args.overview).read_text(encoding="utf-8")
-    profile = args.profile or "opus-planner"
-    model = model_for_profile(profile)
-    planner_prompt = f"""
-You are an AgentOps planner. Create an implementation DAG for this project.
-
-Overview:
-```text
-{overview}
-```
-
-Return ONLY valid JSON with this shape:
-{{
-  "version": 1,
-  "project": "{repo_root().name}",
-  "tasks": [
-    {{
-      "id": "short-kebab-id",
-      "title": "task title",
-      "tranche": 1,
-      "priority": "p0|p1|p2",
-      "executor": "claude|codex|antigravity",
-      "profile": "sonnet-executor|codex-verifier|antigravity-executor",
-      "framework": "generic|vue-quasar|react|fastapi|python|docker-compose|ci|docs|qa",
-      "allowed_paths": ["..."],
-      "locked_paths": ["..."],
-      "acceptance": ["..."],
-      "checks": ["..."]
-    }}
-  ]
-}}
-
-Constraints:
-- Create up to {args.tranches} tranches.
-- Keep tasks narrow and mergeable.
-- Do not grant secret/runtime paths.
-- Include at least one QA/verifier task per major tranche.
-""".strip()
-    out_path = app_root() / "planner" / f"plan-{int(time.time())}.json"
-    cmd = ["claude"]
-    if model:
-        cmd += ["--model", model]
-    cmd += ["-p", planner_prompt]
-    if args.run:
-        log_event("plan.start", profile=profile)
-        proc = subprocess.run(cmd, cwd=repo_root(), text=True, capture_output=True)
-        raw = proc.stdout.strip()
-        (app_root() / "planner" / "last.raw.txt").write_text(raw, encoding="utf-8")
-        try:
-            start = raw.index("{")
-            end = raw.rindex("}") + 1
-            data = json.loads(raw[start:end])
-            for task in data.get("tasks", []):
-                task.setdefault("branch", branch_name(task["id"]))
-            save_active(data)
-            for task in data.get("tasks", []):
-                write_task_prompt(task)
-            write_json(out_path, data)
-            print(f"Plan saved: {out_path}")
-            log_event("plan.complete", path=str(out_path), task_count=len(data.get("tasks", [])))
-        except Exception as e:
-            print(raw)
-            raise SystemExit(f"Planner output was not valid JSON: {e}")
-    else:
-        print(" ".join(shlex_quote(c) for c in cmd))
-
-
-def cmd_tui(args: argparse.Namespace) -> None:
-    try:
-        from rich.console import Console
-        from rich.table import Table
-        from rich.panel import Panel
-        from rich.live import Live
-        from rich.text import Text
-    except ImportError:
-        print("Rich is not installed. Run: pip install rich")
-        return
-    console = Console()
-    def render():
-        table = Table(title="AgentOps Swarm")
-        table.add_column("Task")
-        table.add_column("Tranche")
-        table.add_column("Executor")
-        table.add_column("Worktree")
-        table.add_column("Dirty")
-        table.add_column("Report")
-        for task in load_active().get("tasks", []):
-            tid = task["id"]
-            wt = task_worktree(tid)
-            state = "yes" if wt.exists() else "no"
-            dirty = ""
-            if wt.exists():
-                try:
-                    dirty = "dirty" if subprocess.check_output(["git", "status", "--short"], cwd=wt, text=True).strip() else "clean"
-                except Exception:
-                    dirty = "?"
-            report = "yes" if (app_root()/"reports"/tid/"report.md").exists() else "no"
-            table.add_row(tid, str(task.get("tranche", "")), task.get("executor", ""), state, dirty, report)
-        return Panel(table, title="r/Enter refresh · l list · c collect · b budget · q quit")
-    console.clear()
-    console.print(render())
-    while True:
-        try:
-            ch = input("agentops> ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            break
-        if ch == "q":
-            break
-        if ch == "c":
-            collect_reports()
-        if ch == "b":
-            cmd_budget(argparse.Namespace())
-        console.clear(); console.print(render())
+    data = load_json(BUDGET_PATH, {"runs": []})
+    print(json.dumps(data, indent=2))
 
 
 def cmd_examples_index(args: argparse.Namespace) -> None:
-    base = app_root() / "examples"
-    base.mkdir(parents=True, exist_ok=True)
-    lines = ["# AgentOps examples index", "", f"Generated: {utc_now()}", ""]
-    for p in sorted(base.rglob("*")):
-        if p.is_dir() or p.name == "GENERATED_INDEX.md":
-            continue
-        rel = p.relative_to(base)
-        if path_forbidden(str(rel)):
-            continue
-        size = p.stat().st_size
-        lines.append(f"## `{rel}`")
-        lines.append(f"- size: {size} bytes")
-        if p.suffix.lower() in {".md", ".txt", ".html", ".css", ".json", ".yaml", ".yml"} and size < 100_000:
-            text = p.read_text(encoding="utf-8", errors="replace")[:1200]
-            lines.append("```text")
-            lines.append(text)
-            lines.append("```")
-        lines.append("")
-    out = base / "GENERATED_INDEX.md"
-    out.write_text("\n".join(lines), encoding="utf-8")
-    print(out)
+    examples_index()
+
+
+def cmd_rollback(args: argparse.Namespace) -> None:
+    if args.list:
+        out = run("git branch --list 'agentops/rollback/*' --sort=-committerdate", capture=True).stdout
+        print(out)
+        return
+    if not args.ref:
+        fail("Specify --ref or --list")
+    if not confirm(f"Hard reset current branch to {args.ref}?", default=False, assume_yes=args.yes):
+        return
+    run(["git", "reset", "--hard", args.ref], check=True)
+    ok(f"Rolled back to {args.ref}")
+
+
+def tui_print_header() -> None:
+    print(color("\n╔════════════════════════════════════════════════════╗", "96"))
+    print(color("║              AGENTOPS SWARM CONTROL              ║", "96"))
+    print(color("╚════════════════════════════════════════════════════╝", "96"))
+
+
+def cmd_tui(args: argparse.Namespace) -> None:
+    require_init()
+    while True:
+        tui_print_header()
+        print("1) Status")
+        print("2) Paste/edit task prompt")
+        print("3) Generate DAG with planner model")
+        print("4) Launch selected tasks")
+        print("5) Merge selected tasks")
+        print("6) Clean/retry tasks")
+        print("7) Collect reports")
+        print("8) Events")
+        print("9) Budget")
+        print("10) Examples index")
+        print("q) Quit")
+        choice = input("\nChoice: ").strip().lower()
+        try:
+            if choice == "1":
+                cmd_status(argparse.Namespace())
+            elif choice == "2":
+                tid = input("Task id: ").strip()
+                cmd_prompt(argparse.Namespace(task=tid, file=None, stdin=False, edit=False))
+            elif choice == "3":
+                print("Paste overview. End with EOF.")
+                lines = []
+                while True:
+                    line = input()
+                    if line == "EOF":
+                        break
+                    lines.append(line)
+                tmp = AGENTOPS_DIR / "planner" / "tui-overview.md"
+                tmp.parent.mkdir(exist_ok=True)
+                tmp.write_text("\n".join(lines), encoding="utf-8")
+                tr = int(input("Number of tranches [4]: ").strip() or "4")
+                cmd_plan(argparse.Namespace(overview=str(tmp), tranches=tr, run=True, profile="opus-planner", overwrite=True))
+            elif choice == "4":
+                sel = input("Task ids comma-separated, or tranche number: ").strip()
+                spawn = confirm("Spawn terminals?", default=True)
+                yes = confirm("Allow fallback without asking?", default=False)
+                if sel.isdigit():
+                    ns = argparse.Namespace(task=None, tranche=sel, all=False, spawn=spawn, monitor=True, mode="headless", permission="workspace", terminal="auto", fallback="codex" if yes else "ask", yes=yes, clean_first=False, max_parallel=None, fallback_on_any_failure=True)
+                else:
+                    ids = [x.strip() for x in sel.split(",") if x.strip()]
+                    ns = argparse.Namespace(task=ids, tranche=None, all=False, spawn=spawn, monitor=True, mode="headless", permission="workspace", terminal="auto", fallback="codex" if yes else "ask", yes=yes, clean_first=False, max_parallel=None, fallback_on_any_failure=True)
+                cmd_launch(ns)
+            elif choice == "5":
+                sel = input("Task ids comma-separated, or tranche number: ").strip()
+                auto = confirm("Enable auto-repair if checks fail?", default=False)
+                yes = confirm("Approve repair automatically?", default=False)
+                if sel.isdigit():
+                    ns = argparse.Namespace(task=None, tranche=sel, all=False, auto_repair=auto, repair_attempts=2, repair_profile="sonnet-repair", yes=yes)
+                else:
+                    ns = argparse.Namespace(task=[x.strip() for x in sel.split(",") if x.strip()], tranche=None, all=False, auto_repair=auto, repair_attempts=2, repair_profile="sonnet-repair", yes=yes)
+                cmd_merge(ns)
+            elif choice == "6":
+                tid = input("Task id: ").strip()
+                if confirm(f"Clean and retry {tid}?", default=False):
+                    cmd_retry(argparse.Namespace(task=tid, mode="headless", permission="workspace", no_pretty=False, fallback="ask", yes=False, fallback_on_any_failure=True))
+            elif choice == "7":
+                cmd_collect(argparse.Namespace())
+            elif choice == "8":
+                cmd_events(argparse.Namespace(tail=60, json=False))
+            elif choice == "9":
+                cmd_budget(argparse.Namespace())
+            elif choice == "10":
+                examples_index()
+            elif choice == "q":
+                return
+        except SystemExit as exc:
+            warn(f"Command exited: {exc}")
+        input("\nPress Enter...")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="agentops", description="Reusable local multi-agent swarm orchestrator")
-    p.add_argument("--version", action="version", version=f"agentops {VERSION}")
-    sub = p.add_subparsers(required=True)
-    sp = sub.add_parser("init"); sp.add_argument("--name"); sp.add_argument("--force", action="store_true"); sp.set_defaults(func=cmd_init)
-    sp = sub.add_parser("doctor"); sp.set_defaults(func=cmd_doctor)
-    sp = sub.add_parser("add-task"); sp.add_argument("id"); sp.add_argument("--title"); sp.add_argument("--tranche", type=int, default=1); sp.add_argument("--priority", default="p1"); sp.add_argument("--executor", choices=["claude","codex","antigravity"], default="claude"); sp.add_argument("--profile", default="sonnet-executor"); sp.add_argument("--framework", default="generic"); sp.add_argument("--allowed-path", action="append"); sp.add_argument("--locked-path", action="append"); sp.add_argument("--acceptance", action="append"); sp.add_argument("--check", action="append"); sp.add_argument("--force", action="store_true"); sp.set_defaults(func=cmd_add_task)
-    sp = sub.add_parser("list"); sp.set_defaults(func=cmd_list)
-    sp = sub.add_parser("status"); sp.set_defaults(func=cmd_status)
-    sp = sub.add_parser("create-worktree"); sp.add_argument("task_id"); sp.add_argument("--force", action="store_true"); sp.set_defaults(func=cmd_create_worktree)
-    sp = sub.add_parser("clean"); sp.add_argument("task_id", nargs="*"); sp.add_argument("--tranche", type=int); sp.add_argument("--branches", action="store_true"); sp.add_argument("--reports", action="store_true"); sp.set_defaults(func=cmd_clean)
-    sp = sub.add_parser("launch"); sp.add_argument("--tranche", type=int); sp.add_argument("task_id", nargs="*"); sp.add_argument("--spawn", action="store_true"); sp.add_argument("--monitor", action="store_true"); sp.add_argument("--tui", action="store_true"); sp.add_argument("--mode", choices=["headless","interactive"], default="headless"); sp.add_argument("--permission", choices=["workspace","full"], default="workspace"); sp.add_argument("--terminal", default="auto"); sp.set_defaults(func=cmd_launch)
-    sp = sub.add_parser("run"); sp.add_argument("task_id"); sp.add_argument("--engine", choices=["claude","codex","antigravity"]); sp.add_argument("--mode", choices=["headless","interactive"], default="headless"); sp.add_argument("--permission", choices=["workspace","full"], default="workspace"); sp.add_argument("--spawn", action="store_true"); sp.add_argument("--terminal", default="auto"); sp.set_defaults(func=cmd_run_task)
-    sp = sub.add_parser("_run-task"); sp.add_argument("task_id"); sp.add_argument("--engine", required=True); sp.add_argument("--mode", required=True); sp.add_argument("--permission", required=True); sp.add_argument("--worktree", required=True); sp.add_argument("--prompt", required=True); sp.set_defaults(func=cmd_run_task_internal)
-    sp = sub.add_parser("scout"); sp.add_argument("task_id", nargs="?"); sp.add_argument("--tranche", type=int); sp.add_argument("--profile", default="haiku-scout"); sp.set_defaults(func=cmd_scout)
-    sp = sub.add_parser("merge"); sp.add_argument("task_id", nargs="*"); sp.add_argument("--tranche", type=int); sp.add_argument("--checks", action="store_true", default=True); sp.add_argument("--auto-repair", action="store_true"); sp.add_argument("--repair-attempts", type=int, default=2); sp.add_argument("--repair-profile", default="sonnet-repair"); sp.add_argument("--permission", choices=["workspace","full"], default="workspace"); sp.set_defaults(func=cmd_merge)
-    sp = sub.add_parser("collect"); sp.set_defaults(func=cmd_collect)
-    sp = sub.add_parser("events"); sp.add_argument("--tail", type=int, default=50); sp.add_argument("--json", action="store_true"); sp.set_defaults(func=cmd_events)
-    sp = sub.add_parser("budget"); sp.set_defaults(func=cmd_budget)
-    sp = sub.add_parser("profiles"); sp.add_argument("--verbose", action="store_true"); sp.set_defaults(func=cmd_profiles)
-    sp = sub.add_parser("templates"); ss = sp.add_subparsers(dest="sub", required=True); ssp = ss.add_parser("list"); ssp.set_defaults(func=cmd_templates)
-    sp = sub.add_parser("plan"); sp.add_argument("--overview", required=True); sp.add_argument("--tranches", type=int, default=4); sp.add_argument("--profile", default="opus-planner"); sp.add_argument("--run", action="store_true"); sp.set_defaults(func=cmd_plan)
-    sp = sub.add_parser("tui"); sp.set_defaults(func=cmd_tui)
-    sp = sub.add_parser("examples-index"); sp.set_defaults(func=cmd_examples_index)
+    p = argparse.ArgumentParser(prog="agentops", description="AgentOps Swarm: multi-agent worktree orchestration")
+    p.add_argument("--version", action="version", version=f"agentops {__version__}")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("init")
+    sp.add_argument("--name")
+    sp.add_argument("--force", action="store_true")
+    sp.set_defaults(func=cmd_init)
+
+    sub.add_parser("doctor").set_defaults(func=cmd_doctor)
+
+    sp = sub.add_parser("profiles")
+    sp.add_argument("--verbose", action="store_true")
+    sp.set_defaults(func=cmd_profiles)
+
+    sp = sub.add_parser("templates")
+    s2 = sp.add_subparsers(dest="sub", required=True)
+    s2.add_parser("list")
+    sp.set_defaults(func=cmd_templates)
+
+    sub.add_parser("list").set_defaults(func=cmd_list)
+    sub.add_parser("status").set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("add-task")
+    sp.add_argument("id")
+    sp.add_argument("--title")
+    sp.add_argument("--tranche", default=1)
+    sp.add_argument("--priority", default="p1")
+    sp.add_argument("--executor", default="claude", choices=["claude","codex","antigravity"])
+    sp.add_argument("--profile")
+    sp.add_argument("--framework", default="generic")
+    sp.add_argument("--allowed-path", action="append")
+    sp.add_argument("--locked-path", action="append")
+    sp.add_argument("--acceptance", action="append")
+    sp.add_argument("--check", action="append")
+    sp.set_defaults(func=cmd_add_task)
+
+    sp = sub.add_parser("prompt")
+    sp.add_argument("task")
+    sp.add_argument("--file")
+    sp.add_argument("--stdin", action="store_true")
+    sp.add_argument("--edit", action="store_true")
+    sp.set_defaults(func=cmd_prompt)
+
+    sp = sub.add_parser("plan")
+    sp.add_argument("--overview")
+    sp.add_argument("--tranches", type=int, default=4)
+    sp.add_argument("--run", action="store_true")
+    sp.add_argument("--profile", default="opus-planner")
+    sp.add_argument("--overwrite", action="store_true")
+    sp.set_defaults(func=cmd_plan)
+
+    sp = sub.add_parser("import-plan")
+    sp.add_argument("file")
+    sp.add_argument("--overwrite", action="store_true")
+    sp.set_defaults(func=cmd_import_plan)
+
+    sp = sub.add_parser("scout")
+    sp.add_argument("task", nargs="?")
+    sp.add_argument("--tranche")
+    sp.add_argument("--all", action="store_true")
+    sp.add_argument("--profile", default="haiku-scout")
+    sp.set_defaults(func=cmd_scout)
+
+    sp = sub.add_parser("run")
+    sp.add_argument("task")
+    sp.add_argument("--mode", default="headless", choices=["headless","interactive"])
+    sp.add_argument("--permission", default="workspace", choices=["workspace","full"])
+    sp.add_argument("--profile")
+    sp.add_argument("--spawn", action="store_true")
+    sp.add_argument("--terminal", default="auto")
+    sp.add_argument("--no-pretty", action="store_true")
+    sp.add_argument("--fallback", default="ask", choices=["ask","codex","gpt","antigravity","pause","retry"])
+    sp.add_argument("--fallback-on-any-failure", action="store_true")
+    sp.add_argument("--yes", action="store_true")
+    sp.set_defaults(func=cmd_run)
+
+    sp = sub.add_parser("launch")
+    sp.add_argument("--task", action="append")
+    sp.add_argument("--tranche")
+    sp.add_argument("--all", action="store_true")
+    sp.add_argument("--spawn", action="store_true")
+    sp.add_argument("--monitor", action="store_true")
+    sp.add_argument("--mode", default="headless")
+    sp.add_argument("--permission", default="workspace")
+    sp.add_argument("--terminal", default="auto")
+    sp.add_argument("--fallback", default="ask")
+    sp.add_argument("--fallback-on-any-failure", action="store_true")
+    sp.add_argument("--clean-first", action="store_true")
+    sp.add_argument("--max-parallel", type=int)
+    sp.add_argument("--yes", action="store_true")
+    sp.set_defaults(func=cmd_launch)
+
+    sub.add_parser("collect").set_defaults(func=cmd_collect)
+
+    sp = sub.add_parser("merge")
+    sp.add_argument("task", nargs="*")
+    sp.add_argument("--tranche")
+    sp.add_argument("--all", action="store_true")
+    sp.add_argument("--auto-repair", action="store_true")
+    sp.add_argument("--repair-attempts", type=int, default=1)
+    sp.add_argument("--repair-profile", default="sonnet-repair")
+    sp.add_argument("--yes", action="store_true")
+    sp.set_defaults(func=cmd_merge)
+
+    sp = sub.add_parser("clean")
+    sp.add_argument("task", nargs="*")
+    sp.add_argument("--tranche")
+    sp.add_argument("--all", action="store_true")
+    sp.add_argument("--keep-branch", action="store_true")
+    sp.add_argument("--force", action="store_true")
+    sp.add_argument("--yes", action="store_true")
+    sp.add_argument("--prune", action="store_true")
+    sp.set_defaults(func=cmd_clean)
+
+    sp = sub.add_parser("retry")
+    sp.add_argument("task")
+    sp.add_argument("--mode", default="headless")
+    sp.add_argument("--permission", default="workspace")
+    sp.add_argument("--no-pretty", action="store_true")
+    sp.add_argument("--fallback", default="ask")
+    sp.add_argument("--fallback-on-any-failure", action="store_true")
+    sp.add_argument("--yes", action="store_true")
+    sp.set_defaults(func=cmd_retry)
+
+    sp = sub.add_parser("events")
+    sp.add_argument("--tail", type=int, default=80)
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_events)
+
+    sub.add_parser("budget").set_defaults(func=cmd_budget)
+    sub.add_parser("examples-index").set_defaults(func=cmd_examples_index)
+    sub.add_parser("tui").set_defaults(func=cmd_tui)
+
+    sp = sub.add_parser("rollback")
+    sp.add_argument("--list", action="store_true")
+    sp.add_argument("--ref")
+    sp.add_argument("--yes", action="store_true")
+    sp.set_defaults(func=cmd_rollback)
+
     return p
 
 
-EXAMPLES_README = """# AgentOps examples
-
-Put reference material here:
-
-- images/ screenshots and visual inspiration
-- html/ exported prototypes
-- markdown/ specs and notes
-- sketches/ ASCII or Mermaid sketches
-- flows/ user journeys
-- data/ fake sample data only
-- ui/ design-system notes
-
-Do not put secrets, credentials, logs, backups, real private data, or token files here.
-Run `agentops examples-index` to generate `GENERATED_INDEX.md`.
-"""
-
-
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     args.func(args)
+
 
 if __name__ == "__main__":
     main()

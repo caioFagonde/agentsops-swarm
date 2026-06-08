@@ -1,84 +1,82 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INSTALL_BASE="${AGENTOPS_INSTALL_BASE:-$HOME/.local/share/agentops-swarm}"
-BIN_DIR="${AGENTOPS_BIN_DIR:-$HOME/.local/bin}"
-INSTALL_AGENTS="${AGENTOPS_INSTALL_AGENTS:-true}"
+PREFIX="${AGENTOPS_PREFIX:-$HOME/.local}"
+APP_DIR="$PREFIX/share/agentops-swarm"
+BIN_DIR="$PREFIX/bin"
+INSTALL_TOOLS="${AGENTOPS_INSTALL_TOOLS:-true}"
 
 info(){ printf '\033[0;34m→\033[0m %s\n' "$*"; }
 ok(){ printf '\033[0;32m✓\033[0m %s\n' "$*"; }
 warn(){ printf '\033[1;33m⚠\033[0m %s\n' "$*"; }
-fail(){ printf '\033[0;31m✗\033[0m %s\n' "$*"; exit 1; }
-have(){ command -v "$1" >/dev/null 2>&1; }
 
-info "Installing AgentOps Swarm to $INSTALL_BASE"
-mkdir -p "$INSTALL_BASE" "$BIN_DIR"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+mkdir -p "$APP_DIR" "$BIN_DIR"
+
+info "Installing AgentOps Swarm v3 to $APP_DIR"
 rsync -a --delete \
   --exclude='.git' \
-  "$ROOT/" "$INSTALL_BASE/"
-ln -sf "$INSTALL_BASE/bin/agentops" "$BIN_DIR/agentops"
-chmod +x "$INSTALL_BASE/bin/agentops"
+  --exclude='.agentops' \
+  --exclude='.agent-worktrees' \
+  "$ROOT/" "$APP_DIR/"
+
+cat > "$BIN_DIR/agentops" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+CANDIDATES=(
+  "${AGENTOPS_HOME:-}"
+  "$HOME/.local/share/agentops-swarm"
+  "$HOME/.local/share/agentops-swarm/agentops-swarm"
+)
+AGENTOPS_ROOT=""
+for candidate in "${CANDIDATES[@]}"; do
+  if [[ -n "$candidate" && -f "$candidate/agentops_swarm/cli.py" ]]; then
+    AGENTOPS_ROOT="$candidate"
+    break
+  fi
+done
+if [[ -z "$AGENTOPS_ROOT" ]]; then
+  echo "agentops: could not find agentops_swarm/cli.py" >&2
+  echo "Reinstall with: cd /path/to/agentops-swarm && ./install.sh" >&2
+  exit 1
+fi
+export PYTHONPATH="$AGENTOPS_ROOT:${PYTHONPATH:-}"
+exec "${AGENTOPS_PYTHON:-python3}" -m agentops_swarm.cli "$@"
+EOF
+chmod +x "$BIN_DIR/agentops"
 ok "agentops installed at $BIN_DIR/agentops"
 
-if ! have python3; then warn "python3 not found. Install Python 3.10+ before using AgentOps."; fi
-if ! have git; then warn "git not found. Install Git before using worktrees."; fi
+install_npm_pkg(){
+  local exe="$1" pkg="$2" label="$3"
+  if command -v "$exe" >/dev/null 2>&1; then
+    ok "$label already installed: $($exe --version 2>/dev/null | head -1 || true)"
+    return 0
+  fi
+  if [[ "$INSTALL_TOOLS" != "true" ]]; then
+    warn "$label missing; tool installation disabled"
+    return 0
+  fi
+  if ! command -v npm >/dev/null 2>&1; then
+    warn "npm missing; cannot auto-install $label"
+    return 0
+  fi
+  info "Installing $label via npm package $pkg"
+  npm install -g "$pkg" || warn "$label install failed; install manually"
+}
 
-install_node_linux(){
-  if have node && have npm; then return 0; fi
-  warn "Node/npm not found. Attempting OS package install."
-  if have apt-get; then
-    sudo apt-get update
-    sudo apt-get install -y nodejs npm
-  elif have dnf; then
-    sudo dnf install -y nodejs npm
-  elif have yum; then
-    sudo yum install -y nodejs npm
-  elif have pacman; then
-    sudo pacman -Sy --noconfirm nodejs npm
+install_npm_pkg claude "@anthropic-ai/claude-code" "Claude Code"
+install_npm_pkg codex "@openai/codex" "OpenAI Codex CLI"
+
+if command -v agy >/dev/null 2>&1; then
+  ok "Antigravity CLI already installed"
+elif [[ "$INSTALL_TOOLS" == "true" ]]; then
+  warn "Antigravity CLI not found. Attempting best-effort installer."
+  URL="${AGENTOPS_ANTIGRAVITY_INSTALL_URL:-https://raw.githubusercontent.com/google-antigravity/antigravity-cli/main/install.sh}"
+  if command -v curl >/dev/null 2>&1; then
+    bash -lc "curl -fsSL '$URL' | bash" || warn "Antigravity auto-install failed; install manually and ensure 'agy' is on PATH"
   else
-    warn "Unsupported package manager. Install Node.js 18+ manually."
+    warn "curl missing; cannot auto-install Antigravity"
   fi
-}
-
-install_claude(){
-  if have claude; then ok "Claude Code already installed: $(claude --version 2>/dev/null | head -1 || echo claude)"; return 0; fi
-  info "Installing Claude Code"
-  if [[ "${AGENTOPS_NATIVE_CLAUDE_INSTALL:-true}" == "true" ]]; then
-    curl -fsSL https://claude.ai/install.sh | bash || warn "Native Claude installer failed; trying npm fallback"
-  fi
-  if ! have claude; then
-    install_node_linux
-    npm install -g @anthropic-ai/claude-code
-  fi
-  have claude && ok "Claude Code installed" || warn "Claude Code not found after install"
-}
-
-install_codex(){
-  if have codex; then ok "Codex already installed: $(codex --version 2>/dev/null | head -1 || echo codex)"; return 0; fi
-  info "Installing OpenAI Codex CLI"
-  install_node_linux
-  npm install -g @openai/codex
-  have codex && ok "Codex installed" || warn "Codex not found after install"
-}
-
-install_antigravity(){
-  if have agy || have antigravity; then ok "Antigravity CLI already installed"; return 0; fi
-  info "Installing Google Antigravity CLI"
-  curl -fsSL https://antigravity.google/cli/install.sh | bash || warn "Antigravity CLI installer failed"
-  export PATH="$HOME/.local/bin:$PATH"
-  have agy || have antigravity && ok "Antigravity CLI installed" || warn "Antigravity CLI not found after install. Ensure ~/.local/bin is on PATH."
-}
-
-if [[ "$INSTALL_AGENTS" == "true" ]]; then
-  install_claude
-  install_codex
-  install_antigravity
-fi
-
-if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
-  warn "$BIN_DIR is not in PATH. Add this to your shell profile:"
-  echo "export PATH=\"$BIN_DIR:\$PATH\""
 fi
 
 cat <<EOF
@@ -86,12 +84,13 @@ cat <<EOF
 AgentOps installed.
 
 Next:
+  export PATH="$BIN_DIR:\$PATH"   # add to shell rc if needed
   agentops doctor
   cd /path/to/project
   agentops init --name my-project
   agentops tui
 
-Authentication still requires interactive login:
+Authentication still requires provider login:
   claude doctor
   codex
   agy

@@ -1,27 +1,28 @@
 from pathlib import Path
-import ast
+import subprocess
+import sys
 
 ROOT = Path(__file__).resolve().parents[1]
+CLI = ROOT / "agentops_swarm" / "cli.py"
 
 
-def test_cli_compiles():
-    ast.parse((ROOT / "agentops_swarm" / "cli.py").read_text())
+def run_cmd(*args):
+    return subprocess.run([sys.executable, str(CLI), *args], cwd=ROOT, text=True, capture_output=True)
 
 
-def test_install_scripts_exist():
-    assert (ROOT / "install.sh").exists()
-    assert (ROOT / "install.ps1").exists()
-    assert (ROOT / "bin" / "agentops").exists()
+def test_help():
+    p = run_cmd("--help")
+    assert p.returncode == 0
+    assert "AgentOps" in p.stdout
 
 
-def test_docs_exist():
-    assert (ROOT / "README.md").exists()
-    assert (ROOT / "README.pt-BR.md").exists()
-    assert "Claude" in (ROOT / "README.md").read_text()
-    assert "Codex" in (ROOT / "README.md").read_text()
-    assert "Antigravity" in (ROOT / "README.md").read_text()
+def test_doctor_imports():
+    p = run_cmd("--version")
+    assert p.returncode == 0
+    assert "agentops" in p.stdout
 
 
-def test_examples_exist():
-    assert (ROOT / "examples" / "images").exists()
-    assert (ROOT / "templates" / "prompts" / "personal-os-ui-big-picture.prompt.md").exists()
+def test_templates_exist():
+    assert (ROOT / "templates" / "roles" / "opus-planner.md").exists()
+    assert (ROOT / "templates" / "roles" / "haiku-scout.md").exists()
+    assert (ROOT / "templates" / "frameworks" / "vue-quasar.md").exists()

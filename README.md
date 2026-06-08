@@ -1,53 +1,43 @@
-# AgentOps Swarm
+# AgentOps Swarm v3
 
-AgentOps Swarm is a reusable local orchestration layer for running several AI coding agents against any git project without losing control of merges, tests, or secrets.
+AgentOps Swarm is a reusable local multi-agent orchestration toolkit for Claude Code, OpenAI Codex/GPT, and Google Antigravity. It is designed for senior developers who want controlled high-throughput implementation without losing safety, traceability, or merge discipline.
 
-It coordinates:
+## Core capabilities
 
-- Claude Code / CC for planning, implementation, and repair.
-- OpenAI Codex for verification and narrow implementation.
-- Google Antigravity CLI for additional agent execution.
-- Git worktrees for isolation.
-- Tranches/sprints for staged work.
-- Rich TUI monitoring.
+- Project-local `.agentops/` task graph.
+- Git worktree isolation per task.
+- Opus planner DAG generation.
+- Haiku scout mode.
+- Sonnet/Claude, Codex/GPT, and Antigravity worker profiles.
+- Pretty animated worker dashboards by default.
+- Automatic fallback when Claude/Codex/Antigravity fails or hits usage limits.
+- Confirmation-first fallback and repair by default.
+- Launch selected tasks or whole tranches from CLI/TUI.
+- Prompt paste/edit/import from TUI or CLI.
+- Auto-prune, clean, retry, rollback refs, merge gates, and repair workers.
 - JSON event logs and budget/time tracking.
-- Examples/reference material folders for sketches, screenshots, HTML, markdown, data samples, and UI direction.
-
-## Why this exists
-
-One large prompt against one working tree creates chaos. AgentOps creates a controlled swarm:
-
-```text
-Overview prompt
-  -> Opus planner creates tranches and tasks
-  -> Haiku scout reads quickly and maps the repo
-  -> Sonnet/Codex/Antigravity workers implement in isolated worktrees
-  -> Verifiers and repair nodes handle failures
-  -> You merge one branch at a time
-```
 
 ## Install
 
-### Linux/macOS
+Linux/macOS:
 
 ```bash
 ./install.sh
+export PATH="$HOME/.local/bin:$PATH"
+agentops doctor
 ```
 
-This installs AgentOps under `~/.local/share/agentops-swarm`, links `agentops` into `~/.local/bin`, and optionally installs Claude Code, Codex, and Antigravity CLI.
-
-### Windows PowerShell
+Windows PowerShell:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass -Force
 .\install.ps1
+agentops doctor
 ```
 
-Restart PowerShell after the installer updates PATH.
+The installer attempts to install Claude Code and Codex via npm when missing. Antigravity is best-effort because vendor install methods may change; `agentops doctor` verifies whether `agy` is available.
 
-## Authentication
-
-AgentOps can install the CLIs, but authentication remains interactive:
+Provider login is still interactive:
 
 ```bash
 claude doctor
@@ -60,130 +50,97 @@ agy
 ```bash
 cd /path/to/project
 agentops init --name my-project
-agentops doctor
+agentops tui
 ```
 
-Create an overview prompt:
+Generate a full DAG automatically:
 
 ```bash
-cat > overview.md <<'EOF'
-Improve this project safely. Fix failing tests, improve UX, add documentation, and keep security boundaries intact. Divide work into narrow tranches.
-EOF
+agentops plan --overview overview.md --tranches 4 --run --profile opus-planner --overwrite
+agentops list
 ```
 
-Ask the Opus planner to create a DAG:
-
-```bash
-agentops plan --overview overview.md --tranches 4 --run --profile opus-planner
-```
-
-Scout tranche 1:
+Run scouts:
 
 ```bash
 agentops scout --tranche 1 --profile haiku-scout
 ```
 
-Launch workers:
+Launch tasks with animated dashboards:
 
 ```bash
 agentops launch --tranche 1 --spawn --monitor --mode headless --permission workspace
 ```
 
-Use tmux when GUI terminals do not open:
+Launch aggressively with automatic fallback to Codex when workers fail:
 
 ```bash
-agentops launch --tranche 1 --spawn --terminal tmux --monitor --mode headless --permission workspace
-tmux attach -t agentops
+agentops launch --tranche 1 --spawn --monitor --fallback codex --fallback-on-any-failure --yes
 ```
 
-Merge with automatic repair:
+Merge safely:
 
 ```bash
 agentops collect
-agentops merge --tranche 1 --auto-repair --repair-attempts 2 --repair-profile sonnet-repair
+agentops merge --tranche 1 --auto-repair --repair-attempts 2
 ```
 
-Open TUI:
+Rollback refs are created before merges:
 
 ```bash
-pip install rich
+agentops rollback --list
+agentops rollback --ref agentops/rollback/<name>
+```
+
+## Prompt input
+
+Paste directly:
+
+```bash
+agentops prompt task-id
+# paste prompt, end with EOF
+```
+
+From file:
+
+```bash
+agentops prompt task-id --file prompt.md
+```
+
+From editor:
+
+```bash
+agentops prompt task-id --edit
+```
+
+## TUI
+
+```bash
 agentops tui
 ```
 
+The TUI supports status, prompt paste/edit, planner DAG generation, launch selection, merge, clean/retry, reports, events, budget, and examples indexing.
+
 ## Examples folder
 
-Put implementation examples here:
+Drop reference images, HTML, markdown specs, sketches, and fake data in:
 
-```text
-.agentops/examples/images/
-.agentops/examples/html/
-.agentops/examples/markdown/
-.agentops/examples/sketches/
-.agentops/examples/flows/
-.agentops/examples/data/
-.agentops/examples/ui/
+```txt
+.agentops/examples/
 ```
 
-Index them:
+Generate an index:
 
 ```bash
 agentops examples-index
 ```
 
-Agents are instructed to use examples as references/specs, not as copied assets unless you own them.
+## Safety model
 
-## Common commands
+AgentOps does not blindly merge worker output. The safety boundary is:
 
-```bash
-agentops init --name project
-agentops doctor
-agentops plan --overview overview.md --tranches 4 --run
-agentops add-task ui-fix --title "Fix UI" --tranche 1 --executor claude --framework vue-quasar --allowed-path apps/web --acceptance "Build passes"
-agentops list
-agentops status
-agentops scout --tranche 1
-agentops launch --tranche 1 --spawn --monitor
-agentops run ui-fix --mode interactive
-agentops collect
-agentops merge --tranche 1 --auto-repair
-agentops events --tail 100
-agentops budget
-agentops tui
+```txt
+isolated worktree → report → tests/checks → sequential merge → rollback ref → optional repair worker
 ```
 
-## Permission modes
-
-`--permission workspace` keeps agents sandboxed where the underlying CLI supports it.
-
-`--permission full` maps to bypass/full-access modes. Use it only because each agent runs inside a git worktree, and merges are gated by tests.
-
-Never run full-permission agents directly in your main working tree.
-
-## Engines
-
-- `claude`: Claude Code CLI.
-- `codex`: OpenAI Codex CLI.
-- `antigravity`: Google Antigravity CLI (`agy` preferred, `antigravity` fallback).
-
-Antigravity CLI is primarily a TUI. AgentOps supports it best in interactive mode; headless mode uses best-effort `/goal` piping or `AGENTOPS_ANTIGRAVITY_COMMAND_TEMPLATE` when you define a version-specific command.
-
-## Security policy
-
-AgentOps blocks obvious secret/runtime paths in task grants and tells agents not to read or modify secrets. This is not a substitute for reviewing diffs. Always inspect before pushing.
-
-Forbidden by default:
-
-```text
-.env, secrets, backups, logs, tokens, credentials, private keys, OAuth files, local data
-```
-
-## GitHub private repo workflow
-
-```bash
-git init
-git add .
-git commit -m "Initial AgentOps Swarm"
-gh repo create my-agentops-swarm --private --source=. --push
-```
-
-Or create the private repo in GitHub and push manually.
+Avoid using `--permission full` unless the task is tightly scoped and the worktree is disposable.

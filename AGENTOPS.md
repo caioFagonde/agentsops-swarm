@@ -1,9 +1,10 @@
-# AgentOps operating rules
+# AgentOps Operating Rules
 
-1. Always work through git worktrees.
-2. Do not grant secrets/runtime paths.
-3. Prefer scoped workers over broad prompts.
-4. Merge one task branch at a time.
-5. Run tests after every merge.
-6. Use auto-repair only for concrete test/check failures.
-7. The human owns final push/release.
+- Never read or commit secrets, credentials, tokens, backups, logs, or private data.
+- Use one worktree per task.
+- Keep every task bounded.
+- Write reports.
+- Run checks before merge.
+- Ask before fallback or repair unless explicitly allowed.
+- Create rollback refs before merge.
+- Human makes final push.

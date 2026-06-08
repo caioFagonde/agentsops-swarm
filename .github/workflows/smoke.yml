@@ -1,7 +1,5 @@
 name: smoke
-on:
-  push:
-  pull_request:
+on: [push, pull_request]
 jobs:
   smoke:
     runs-on: ubuntu-latest
@@ -9,7 +7,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.11'
       - run: python -m py_compile agentops_swarm/cli.py
-      - run: bash -n install.sh
       - run: python -m pytest tests -q
+      - run: bash -n install.sh

@@ -1,7 +1,25 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-export PYTHONPATH="$ROOT_DIR:${PYTHONPATH:-}"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
-exec "$PYTHON_BIN" -m agentops_swarm.cli "$@"
+
+CANDIDATES=(
+  "${AGENTOPS_HOME:-}"
+  "$HOME/.local/share/agentops-swarm"
+  "$HOME/.local/share/agentops-swarm/agentops-swarm"
+  "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+)
+
+AGENTOPS_ROOT=""
+for candidate in "${CANDIDATES[@]}"; do
+  if [[ -n "$candidate" && -f "$candidate/agentops_swarm/cli.py" ]]; then
+    AGENTOPS_ROOT="$candidate"
+    break
+  fi
+done
+
+if [[ -z "$AGENTOPS_ROOT" ]]; then
+  echo "agentops: could not locate agentops_swarm/cli.py" >&2
+  exit 1
+fi
+
+export PYTHONPATH="$AGENTOPS_ROOT:${PYTHONPATH:-}"
+exec "${AGENTOPS_PYTHON:-python3}" -m agentops_swarm.cli "$@"
