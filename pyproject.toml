@@ -1,0 +1,15 @@
+[project]
+name = "agentops-swarm"
+version = "2.1.0"
+description = "Reusable local multi-agent orchestration for Claude Code, Codex, and Antigravity"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+tui = ["rich>=13.0"]
+
+[project.scripts]
+agentops = "agentops_swarm.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
