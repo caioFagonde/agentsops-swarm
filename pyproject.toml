@@ -1,8 +1,24 @@
 [project]
 name = "agentops-swarm"
-version = "3.0.0"
-description = "Local multi-agent worktree orchestration for Claude Code, Codex, and Antigravity"
+version = "4.0.0"
+description = "SOTA multi-agent worktree orchestration with multi-tier model routing, smart context, and auto course generation"
 requires-python = ">=3.10"
+license = {text = "MIT"}
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+  "pytest-cov",
+  "ruff",
+]
 
 [tool.pytest.ini_options]
 addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
